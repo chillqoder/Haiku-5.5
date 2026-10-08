@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orc Warrior</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1a1f; color: #e8e2d6; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { display: block; }
+  #title { position: fixed; top: 24px; left: 28px; pointer-events: none; }
+  #title h1 { margin: 0; font-size: 22px; letter-spacing: 0.5px; text-shadow: 0 2px 8px #000; }
+  #title p { margin: 6px 0 0; font-size: 13px; opacity: 0.6; }
+  #attackBtn {
+    position: fixed; bottom: 36px; left: 50%; transform: translateX(-50%);
+    padding: 14px 44px; font-size: 20px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase;
+    color: #ffe9e0; background: linear-gradient(#9b1616, #4e0707);
+    border: 2px solid #ff5a3c; border-radius: 14px; cursor: pointer;
+    animation: pulse 2.4s ease-in-out infinite;
+    transition: transform 0.12s, box-shadow 0.2s, filter 0.2s;
+  }
+  #attackBtn:hover { filter: brightness(1.15); box-shadow: 0 0 34px rgba(255, 90, 60, 0.9); }
+  #attackBtn:active { transform: translateX(-50%) scale(0.95); }
+  #attackBtn:disabled { opacity: 0.6; cursor: default; animation: none; }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 18px rgba(255, 70, 40, 0.45); }
+    50% { box-shadow: 0 0 28px rgba(255, 70, 40, 0.8); }
+  }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="title">
+  <h1>Orc Warrior — Click to Attack</h1>
+  <p>Drag to rotate · Scroll to zoom</p>
+</div>
+<button id="attackBtn">Attack!</button>
+<div id="flash"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- Константы и состояние ----------
+const SKIN = '#4a7c3a';
+const SWING_TIME = 1.0;      // полная длительность атаки, с
+const IMPACT_TIME = 0.55;    // момент удара, с
+const SHAKE_TIME = 0.15;     // длительность тряски камеры, с
+const SHAKE_AMP = 0.06;      // амплитуда тряски камеры
+
+const state = { time: 0, isAttacking: false, attackT: 0, impactDone: false };
+const shake = { t: 0, offset: new THREE.Vector3() };
+const clock = new THREE.Clock();
+const effects = [];          // активные частицы и кольца
+const parts = {};            // именованные анимируемые группы
+let renderer, scene, camera, controls, axeTip, axeMat, attackBtn, flashEl, audioCtx = null;
+
+// ---------- Материалы ----------
+const mat = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.8, metalness: 0, ...extra });
+const M = {
+  skin: mat(SKIN),
+  skinDark: mat('#3a6029'),
+  skinBright: mat('#52883f'),
+  leather: mat('#4b2f1b', { roughness: 0.95 }),
+  leatherDark: mat('#2b1b10', { roughness: 0.95 }),
+  iron: mat('#5b5f66', { metalness: 0.7, roughness: 0.4 }),
+  wood: mat('#5b3a1e', { roughness: 0.9 }),
+  bone: mat('#e8e1c9', { roughness: 0.5 }),
+  eyeWhite: mat('#f2f2ea', { roughness: 0.3 }),
+  pupil: mat('#111111', { roughness: 0.2 }),
+  hair: mat('#1e140c', { roughness: 1 }),
+};
+
+// Меш с тенями; добавляется к родителю с нужным трансформом
+function add(parent, geo, material, { pos = [0, 0, 0], rot = [0, 0, 0], scale = [1, 1, 1] } = {}) {
+  const m = new THREE.Mesh(geo, material);
+  m.position.set(...pos);
+  m.rotation.set(...rot);
+  m.scale.set(...scale);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  parent.add(m);
+  return m;
+}
+
+// Группа-шарнир в точке сустава
+function pivot(parent, name, pos) {
+  const g = new THREE.Group();
+  g.name = name;
+  g.position.set(...pos);
+  parent.add(g);
+  return g;
+}
+
+// ---------- Renderer, сцена, камера, управление ----------
+function setupScene() {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color('#1a1a1f');
+  scene.fog = new THREE.Fog('#1a1a1f', 10, 28);
+
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(3, 3, 6);
+
+  // Орбитальное управление: вращение мышью, зум колесом, инерция
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.2, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 3;
+  controls.maxDistance = 14;
+  controls.maxPolarAngle = Math.PI * 0.49;   // не уходить под землю
+  controls.update();
+}
+
+// Свет: заполняющий, основной тёплый с тенями, холодный контровый
+function setupLights() {
+  scene.add(new THREE.HemisphereLight(0x9fb4d0, 0x2a2014, 0.9));
+
+  const sun = new THREE.DirectionalLight(0xffd7a0, 2.6);
+  sun.position.set(-4, 6, 3);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  const sc = sun.shadow.camera;
+  sc.left = -4; sc.right = 4; sc.top = 4; sc.bottom = -4; sc.near = 1; sc.far = 20;
+  sc.updateProjectionMatrix();
+  sun.shadow.bias = -0.0005;
+  sun.shadow.normalBias = 0.02;
+  scene.add(sun);
+
+  const rim = new THREE.DirectionalLight(0x7f9cff, 1.2);   // контровый свет для силуэта
+  rim.position.set(3, 4, -5);
+  scene.add(rim);
+}
+
+// Земля: тёмный круг, принимает тени
+function createGround() {
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(12, 64), mat('#2c3b24', { roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+}
+
+// ---------- Орк: иерархия групп ----------
+// Ноги: шарнир в тазу (y = 1.0), колено — дочерняя группа
+function createLeg(root, x, name) {
+  const hip = pivot(root, name, [x, 1.0, 0]);
+  add(hip, new THREE.CapsuleGeometry(0.15, 0.2, 6, 12), M.skin, { pos: [0, -0.25, 0] });        // бедро
+  const knee = pivot(hip, name + 'Knee', [0, -0.5, 0]);
+  add(knee, new THREE.CapsuleGeometry(0.13, 0.18, 6, 12), M.skin, { pos: [0, -0.22, 0] });       // голень
+  add(knee, new THREE.BoxGeometry(0.34, 0.3, 0.46), M.leatherDark, { pos: [0, -0.36, 0.05] });   // сапог
+  return hip;
+}
+
+// Голова: шарнир на шее; внутри — череп, челюсть, клыки, уши, глаза
+function createHead(torso) {
+  const head = pivot(torso, 'head', [0, 1.18, 0]);
+  add(head, new THREE.SphereGeometry(0.28, 24, 18), M.skin, { pos: [0, 0.25, 0], scale: [0.95, 1.08, 1] });  // череп
+  add(head, new THREE.BoxGeometry(0.4, 0.14, 0.36), M.skinDark, { pos: [0, 0, 0.06] });                  // челюсть
+  add(head, new THREE.BoxGeometry(0.54, 0.1, 0.18), M.skinDark, { pos: [0, 0.42, 0.25] });               // надбровье
+  add(head, new THREE.CylinderGeometry(0.07, 0.1, 0.22, 10), M.hair, { pos: [0, 0.6, -0.12] });          // пучок волос
+  for (const s of [-1, 1]) {
+    add(head, new THREE.SphereGeometry(0.075, 12, 10), M.eyeWhite, { pos: [0.13 * s, 0.34, 0.25] });      // глаз
+    add(head, new THREE.SphereGeometry(0.035, 10, 8), M.pupil, { pos: [0.13 * s, 0.34, 0.31] });          // зрачок
+    add(head, new THREE.ConeGeometry(0.045, 0.2, 8), M.bone, { pos: [0.15 * s, 0.04, 0.3], rot: [0, 0, -0.12 * s] }); // клык
+    add(head, new THREE.ConeGeometry(0.075, 0.38, 8), M.skin, { pos: [0.34 * s, 0.22, -0.02], rot: [0, 0, -s * (Math.PI / 2 - 0.35)] }); // ухо
+  }
+  return head;
+}
+
+// Рука: шарниры плеча, локтя и запястья; side: -1 — правая рука орка, +1 — левая
+// Группы кладутся в parts: rightArm/rightFore/rightHand (или left...)
+function createArm(torso, side) {
+  const k = side < 0 ? 'right' : 'left';
+  const shoulder = pivot(torso, k + 'Arm', [0.58 * side, 0.9, 0]);
+  add(shoulder, new THREE.SphereGeometry(0.25, 16, 12, 0, Math.PI * 2, 0, Math.PI / 2), M.iron, { pos: [0, 0.02, 0] }); // наплечник
+  add(shoulder, new THREE.CapsuleGeometry(0.13, 0.42, 6, 12), M.skin, { pos: [0, -0.34, 0] });    // плечо
+  const elbow = pivot(shoulder, k + 'Fore', [0, -0.68, 0]);
+  add(elbow, new THREE.CapsuleGeometry(0.105, 0.36, 6, 12), M.skin, { pos: [0, -0.285, 0] });     // предплечье
+  add(elbow, new THREE.CylinderGeometry(0.12, 0.115, 0.16, 14), M.leather, { pos: [0, -0.15, 0] }); // наруч
+  const wrist = pivot(elbow, k + 'Hand', [0, -0.57, 0]);
+  add(wrist, new THREE.SphereGeometry(0.16, 14, 12), M.skinBright, { scale: [1, 1.15, 0.9] });    // кулак
+  parts[k + 'Arm'] = shoulder;
+  parts[k + 'Fore'] = elbow;
+  parts[k + 'Hand'] = wrist;
+}
+
+// Сборка орка: ноги → торс (пояс y = 1.0) → голова и руки как дочерние группы торса
+function createOrc() {
+  const root = new THREE.Group();
+  root.name = 'orc';
+  parts.root = root;
+
+  parts.legR = createLeg(root, -0.26, 'legR');
+  parts.legL = createLeg(root, 0.26, 'legL');
+
+  const torso = pivot(root, 'torso', [0, 1.0, 0]);
+  parts.torso = torso;
+  add(torso, new THREE.BoxGeometry(0.78, 0.26, 0.46), M.leather, { pos: [0, -0.1, 0] });           // таз
+  parts.chest = add(torso, new THREE.CapsuleGeometry(0.34, 0.32, 8, 16), M.skin, { pos: [0, 0.5, 0], scale: [1.35, 1, 0.95] }); // широкая грудь
+  add(torso, new THREE.TorusGeometry(0.47, 0.045, 8, 28), M.leather, { rot: [Math.PI / 2, 0, 0], scale: [1, 0.72, 1] }); // пояс
+  add(torso, new THREE.BoxGeometry(0.1, 0.1, 0.05), M.iron, { pos: [0, 0, 0.36] });                 // пряжка
+  add(torso, new THREE.BoxGeometry(0.08, 1.05, 0.03), M.leatherDark, { pos: [0, 0.5, 0.34], rot: [0, 0, 0.55] }); // ремень через грудь
+  add(torso, new THREE.BoxGeometry(0.36, 0.36, 0.04), M.leatherDark, { pos: [0, -0.2, 0.25] });     // набедренная повязка
+  add(torso, new THREE.CylinderGeometry(0.16, 0.2, 0.22, 12), M.skinDark, { pos: [0, 1.04, 0] });   // шея
+  parts.head = createHead(torso);
+
+  createArm(torso, -1);   // правая рука — в ней топор
+  createArm(torso, 1);    // левая рука — пустая
+  return root;
+}
+
+// ---------- Боевой топор (дочерний к кисти правой руки) ----------
+// Рукоять идёт от навершия над кулаком вниз; голова — на дальнем конце рукояти (локальный -Y)
+function createAxe(hand) {
+  const axe = new THREE.Group();
+  axe.name = 'axe';
+  hand.add(axe);
+
+  // Рукоять, навершие, обмотка
+  add(axe, new THREE.CylinderGeometry(0.03, 0.036, 1.4, 10), M.wood, { pos: [0, -0.45, 0] });
+  add(axe, new THREE.SphereGeometry(0.06, 12, 10), M.iron, { pos: [0, 0.27, 0] });
+  for (const y of [-0.22, -0.3, -0.38]) {
+    add(axe, new THREE.TorusGeometry(0.04, 0.012, 6, 14), M.leather, { pos: [0, y, 0], rot: [Math.PI / 2, 0, 0] });
+  }
+
+  // Голова: втулка и два полумесяца-лезвия (с обеих сторон)
+  const axeHead = pivot(axe, 'axeHead', [0, -1.02, 0]);
+  axeHead.rotation.y = Math.PI / 2;   // лезвия в плоскости взмаха: режущая кромка идёт вперёд, грани — в стороны
+  add(axeHead, new THREE.BoxGeometry(0.14, 0.26, 0.09), M.iron);
+  const shape = new THREE.Shape();
+  // Полумесяц: выпуклая режущая кромка и почти прямая внутренняя сторона у втулки
+  shape.moveTo(0.04, 0.2);
+  shape.bezierCurveTo(0.3, 0.3, 0.48, 0.12, 0.46, 0.0);
+  shape.bezierCurveTo(0.44, -0.12, 0.3, -0.28, 0.04, -0.2);
+  shape.quadraticCurveTo(-0.02, 0, 0.04, 0.2);
+  shape.closePath();
+  const bladeGeo = new THREE.ExtrudeGeometry(shape, {
+    depth: 0.03, bevelEnabled: true, bevelSize: 0.008, bevelThickness: 0.008, bevelSegments: 2, curveSegments: 16,
+  });
+  bladeGeo.translate(0, 0, -0.015);   // центрируем по толщине
+  // Сталь с лёгкой эмиссией: вспыхивает при ударе (см. onImpact)
+  axeMat = new THREE.MeshStandardMaterial({ color: '#8a8f98', metalness: 0.9, roughness: 0.25, emissive: '#ff4a1a', emissiveIntensity: 0 });
+  add(axeHead, bladeGeo, axeMat);
+  add(axeHead, bladeGeo, axeMat, { scale: [-1, 1, 1] });   // зеркальное лезвие с другой стороны
+
+  // Точка контакта — край лезвия; отсюда летят частицы удара
+  axeTip = new THREE.Object3D();
+  axeTip.position.set(0.46, 0.0, 0);
+  axeHead.add(axeTip);
+
+  // Красноватый точечный свет, едет вместе с топором
+  const glow = new THREE.PointLight(0xff5a1f, 3, 4, 2);
+  glow.position.set(0.3, -0.6, 0.3);
+  axe.add(glow);
+}
+
+// ---------- Анимация атаки ----------
+// Angles in radians. The arm and axe extend along local -Y: negative X rotation
+// raises them forward and overhead; increasing X from that pose chops downward.
+// Keep torso twist small so the strike stays in a nearly vertical plane.
+const SWING = [
+  { t: 0.00, arm: -0.15, fore: -0.55, torsoX: 0,     torsoY: 0,     lean: 0,     legR: 0 },      // Rest
+  { t: 0.35, arm: -2.75, fore: -0.35, torsoX: -0.12, torsoY: -0.12, lean: -0.04, legR: 0.2 },    // Axe overhead
+  { t: 0.55, arm: -1.25, fore:  0.10, torsoX: 0.25,  torsoY: 0.12,  lean: 0.05,  legR: -0.05 },  // Downward impact
+  { t: 1.00, arm: -0.15, fore: -0.55, torsoX: 0,     torsoY: 0,     lean: 0,     legR: 0 },      // Recover
+];
+// Easing для каждого отрезка: замах — ease-out, удар — ease-in (резкий), возврат — ease-in-out
+const EASE = [
+  u => 1 - Math.pow(1 - u, 3),
+  u => u * u * u,
+  u => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2),
+];
+
+// Интерполяция позы по ключевым кадрам
+function sampleSwing(t) {
+  for (let i = 0; i < SWING.length - 1; i++) {
+    const a = SWING[i], b = SWING[i + 1];
+    if (t <= b.t) {
+      const u = EASE[i]((t - a.t) / (b.t - a.t));
+      const pose = {};
+      for (const key of Object.keys(a)) {
+        if (key !== 't') pose[key] = a[key] + (b[key] - a[key]) * u;
+      }
+      return pose;
+    }
+  }
+  return SWING[SWING.length - 1];
+}
+
+// Покой: топор чуть покачивается
+function idlePose(s) {
+  return { arm: -0.15 + 0.03 * Math.sin(s * 1.1), fore: -0.55, torsoX: 0, torsoY: 0, lean: 0, legR: 0 };
+}
+
+// Дыхание, левая рука и взгляд — работают всегда, и в покое, и в атаке
+function updateIdle(s) {
+  parts.chest.scale.y = 1 + 0.015 * Math.sin(s * 2);
+  parts.leftArm.rotation.x = 0.05 + 0.05 * Math.sin(s * 1.4);
+  parts.leftFore.rotation.x = -0.5 + 0.03 * Math.sin(s * 1.4 + 1);
+  parts.head.rotation.y = 0.12 * Math.sin(s * 0.5);
+}
+
+// Главный апдейт позы: атака (если идёт) или покой
+function updateAnimation(dt) {
+  state.time += dt;
+  updateIdle(state.time);
+
+  let pose;
+  let impactNow = false;
+  if (state.isAttacking) {
+    state.attackT += dt;
+    if (!state.impactDone && state.attackT >= IMPACT_TIME) {
+      state.impactDone = true;
+      impactNow = true;
+    }
+    if (state.attackT >= SWING_TIME) finishAttack();
+    // Show the contact pose even when a frame steps past the impact timestamp.
+    pose = sampleSwing(impactNow ? IMPACT_TIME : Math.min(state.attackT, SWING_TIME));
+  } else {
+    pose = idlePose(state.time);
+  }
+
+  parts.rightArm.rotation.x = pose.arm;
+  parts.rightFore.rotation.x = pose.fore;
+  parts.torso.rotation.set(pose.torsoX, pose.torsoY, 0);
+  parts.root.rotation.x = pose.lean;
+  parts.legR.rotation.x = pose.legR;
+
+  // Read the blade position only after all joints reach the contact pose.
+  if (impactNow) onImpact();
+}
+
+// Запуск атаки по клику; повторные клики во время замаха игнорируются
+function playAttack() {
+  if (state.isAttacking) return;
+  state.isAttacking = true;
+  state.attackT = 0;
+  state.impactDone = false;
+  attackBtn.disabled = true;
+}
+
+function finishAttack() {
+  state.isAttacking = false;
+  attackBtn.disabled = false;
+}
+
+// ---------- Эффекты удара ----------
+// Вызывается в момент касания (IMPACT_TIME)
+function onImpact() {
+  const tip = axeTip.getWorldPosition(new THREE.Vector3());
+  spawnImpactParticles(tip);
+  spawnImpactRing(tip);
+  shake.t = SHAKE_TIME;
+  axeMat.emissiveIntensity = 1.5;
+  flashScreen();
+  playThud();
+}
+
+// Взрыв частиц: случайные скорости, гравитация, затухание за 0.5 с
+function spawnImpactParticles(origin) {
+  const count = 60;
+  const positions = new Float32Array(count * 3);
+  const velocities = [];
+  for (let i = 0; i < count; i++) {
+    positions.set([origin.x, origin.y, origin.z], i * 3);
+    const dir = new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.8, Math.random() - 0.5).normalize();
+    velocities.push(dir.multiplyScalar(1.5 + Math.random() * 2.5));
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.PointsMaterial({
+    color: 0xffa040, size: 0.07, transparent: true, opacity: 1, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const obj = new THREE.Points(geo, material);
+  scene.add(obj);
+  effects.push({ type: 'particles', obj, velocities, age: 0, life: 0.5 });
+}
+
+// Расширяющееся кольцо ударной волны, повёрнутое к камере
+function spawnImpactRing(origin) {
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xffb347, transparent: true, opacity: 1, side: THREE.DoubleSide, depthWrite: false,
+  });
+  const obj = new THREE.Mesh(new THREE.RingGeometry(0.05, 0.12, 32), material);
+  obj.position.copy(origin);
+  obj.lookAt(camera.position);
+  scene.add(obj);
+  effects.push({ type: 'ring', obj, age: 0, life: 0.5 });
+}
+
+// Обновление эффектов: движение частиц, рост кольца, затухание, очистка; гашение свечения стали
+function updateEffects(dt) {
+  for (let i = effects.length - 1; i >= 0; i--) {
+    const e = effects[i];
+    e.age += dt;
+    const k = Math.min(e.age / e.life, 1);
+    if (e.type === 'particles') {
+      const pos = e.obj.geometry.attributes.position;
+      e.velocities.forEach((v, j) => {
+        v.y -= 9 * dt;   // гравитация
+        pos.setXYZ(j, pos.getX(j) + v.x * dt, pos.getY(j) + v.y * dt, pos.getZ(j) + v.z * dt);
+      });
+      pos.needsUpdate = true;
+    } else {
+      e.obj.scale.setScalar(1 + k * 6);
+    }
+    e.obj.material.opacity = 1 - k;
+    if (k >= 1) {
+      scene.remove(e.obj);
+      e.obj.geometry.dispose();
+      e.obj.material.dispose();
+      effects.splice(i, 1);
+    }
+  }
+  axeMat.emissiveIntensity = Math.max(0, axeMat.emissiveIntensity - 2.5 * dt);
+}
+
+// Тряска камеры: смещение затухает за SHAKE_TIME; прошлое смещение снимается в animate()
+function updateShake(dt) {
+  shake.t = Math.max(0, shake.t - dt);
+  const amp = SHAKE_AMP * (shake.t / SHAKE_TIME);
+  const rnd = () => (Math.random() * 2 - 1) * amp;
+  shake.offset.set(rnd(), rnd(), rnd());
+  camera.position.add(shake.offset);
+}
+
+// Белая вспышка экрана: сразу 35% непрозрачности, плавно в ноль
+function flashScreen() {
+  flashEl.style.transition = 'none';
+  flashEl.style.opacity = '0.35';
+  requestAnimationFrame(() => {
+    flashEl.style.transition = 'opacity 0.3s ease-out';
+    flashEl.style.opacity = '0';
+  });
+}
+
+// Глухой удар через Web Audio: синус с падающей частотой и затуханием, без аудиофайлов
+function playThud() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const now = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.exponentialRampToValueAtTime(38, now + 0.3);
+    gain.gain.setValueAtTime(0.9, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.4);
+  } catch (err) {
+    // Звук необязателен: если браузер не дал аудио, просто пропускаем
+  }
+}
+
+// ---------- UI ----------
+function setupUI() {
+  attackBtn = document.getElementById('attackBtn');
+  flashEl = document.getElementById('flash');
+  attackBtn.addEventListener('click', playAttack);
+}
+
+// Адаптация под размер окна
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// Цикл кадра: снять прошлую тряску → орбита → наложить новую тряску → поза и эффекты → рендер
+function animate() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  camera.position.sub(shake.offset);
+  controls.update();
+  updateShake(dt);
+  updateAnimation(dt);
+  updateEffects(dt);
+  renderer.render(scene, camera);
+}
+
+// ---------- Запуск ----------
+setupScene();
+setupLights();
+createGround();
+createOrc();
+scene.add(parts.root);
+createAxe(parts.rightHand);
+setupUI();
+window.addEventListener('resize', onResize);
+renderer.setAnimationLoop(animate);
+</script>
+</body>
+</html>

@@ -1,0 +1,3077 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Dust &amp; Dynamite</title>
+<link rel="icon" href="data:,">
+<style>
+  html,body{margin:0;height:100%;background:#07050b;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  body.touch{align-items:flex-start}
+  #game{display:block;image-rendering:pixelated;image-rendering:crisp-edges}
+  #touch{display:none;position:fixed;left:0;right:0;bottom:0;height:36%;pointer-events:none;--bs:min(14vh,60px)}
+  body.touch #touch{display:block}
+  #touch>div{position:absolute;display:grid;gap:6px}
+  #touch .b{pointer-events:auto;display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:var(--bs);height:var(--bs);background:rgba(255,255,255,.14);border:2px solid rgba(255,255,255,.4);border-radius:12px;color:#fff;font:700 13px/1 system-ui,sans-serif;touch-action:none}
+  #touch .b.on{background:rgba(255,200,80,.45)}
+  #dpad{left:2%;bottom:2%;grid-template-columns:repeat(3,var(--bs));grid-template-rows:repeat(3,var(--bs))}
+  #act{right:2%;bottom:2%;grid-template-columns:repeat(3,var(--bs))}
+  #sys{display:none;position:fixed;top:8px;right:8px;gap:6px}
+  body.touch #sys{display:flex}
+  #sys .b{pointer-events:auto;padding:8px 10px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.14);border:2px solid rgba(255,255,255,.4);border-radius:10px;color:#fff;font:700 12px/1 system-ui,sans-serif;touch-action:none}
+  #sys .b.on{background:rgba(255,200,80,.45)}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="touch">
+  <div id="dpad">
+    <div class="b" data-a="up" style="grid-column:2;grid-row:1">&#9650;</div>
+    <div class="b" data-a="left" style="grid-column:1;grid-row:2">&#9664;</div>
+    <div class="b" data-a="right" style="grid-column:3;grid-row:2">&#9654;</div>
+    <div class="b" data-a="down" style="grid-column:2;grid-row:3">&#9660;</div>
+  </div>
+  <div id="act">
+    <div class="b" data-a="jump">JUMP</div>
+    <div class="b" data-a="fire">FIRE</div>
+    <div class="b" data-a="use">USE</div>
+    <div class="b" data-a="grenade">GRN</div>
+    <div class="b" data-a="knife">KNIFE</div>
+    <div class="b" data-a="weapon">WPN</div>
+  </div>
+</div>
+<div id="sys">
+  <div class="b" data-a="start">START</div>
+  <div class="b" data-a="pause">PAUSE</div>
+  <div class="b" data-a="mute">MUTE</div>
+</div>
+<script>
+"use strict";
+// ============================================================
+// 1. CORE - constants, math helpers, storage
+// ============================================================
+const W = 384, H = 216;             // logical screen size (pixel-art resolution)
+const TS = 8;                       // tile size in pixels
+const TH = 27;                      // level height in tiles (27 * 8 = 216 px)
+const GROUND = 23;                  // first solid ground row; feet stand on y = 184
+const GROUND_Y = GROUND * TS;
+const STEP = 1 / 60;                // fixed simulation step (seconds)
+const GRAV = 620;                   // gravity (px/s^2)
+const MAX_FALL = 330;
+
+const rr = (a, b) => a + (b - a) * Math.random();
+const ri = (a, b) => Math.floor(rr(a, b + 1));
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const approach = (v, t, d) => (v < t ? Math.min(v + d, t) : Math.max(v - d, t));
+const sgn = v => (v < 0 ? -1 : v > 0 ? 1 : 0);
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const hash = (x, y) => {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+// Entities are anchored at the bottom centre: x = centre, y = feet, h = height above feet.
+const boxOf = e => ({ l: e.x - e.w / 2, r: e.x + e.w / 2, t: e.y - e.h, b: e.y });
+const rectHit = (a, b) => a.l < b.r && a.r > b.l && a.t < b.b && a.b > b.t;
+const inRect = (px, py, r) => px >= r.l && px <= r.r && py >= r.t && py <= r.b;
+
+let T = 0;                          // simulation clock (seconds)
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } }
+};
+
+// ============================================================
+// 2. DISPLAY - 384x216 canvas scaled to the window, bitmap font
+// ============================================================
+const cv = document.getElementById('game');
+const g = cv.getContext('2d');
+cv.width = W;
+cv.height = H;
+g.imageSmoothingEnabled = false;
+
+function fitCanvas() {
+  const touch = document.body.classList.contains('touch');
+  const availH = touch ? innerHeight * 0.64 : innerHeight;
+  const s = Math.min(innerWidth / W, availH / H);
+  const k = s >= 1 ? Math.floor(s) : s;          // whole-number scale keeps pixels crisp
+  cv.style.width = Math.floor(W * k) + 'px';
+  cv.style.height = Math.floor(H * k) + 'px';
+}
+addEventListener('resize', fitCanvas);
+
+// 3x5 pixel font, every glyph is three columns wide
+const FONT = {
+  'A': ['.#.', '#.#', '###', '#.#', '#.#'], 'B': ['##.', '#.#', '##.', '#.#', '##.'],
+  'C': ['.##', '#..', '#..', '#..', '.##'], 'D': ['##.', '#.#', '#.#', '#.#', '##.'],
+  'E': ['###', '#..', '##.', '#..', '###'], 'F': ['###', '#..', '##.', '#..', '#..'],
+  'G': ['.##', '#..', '#.#', '#.#', '.##'], 'H': ['#.#', '#.#', '###', '#.#', '#.#'],
+  'I': ['###', '.#.', '.#.', '.#.', '###'], 'J': ['..#', '..#', '..#', '#.#', '.#.'],
+  'K': ['#.#', '#.#', '##.', '#.#', '#.#'], 'L': ['#..', '#..', '#..', '#..', '###'],
+  'M': ['#.#', '###', '###', '#.#', '#.#'], 'N': ['##.', '#.#', '#.#', '#.#', '#.#'],
+  'O': ['.#.', '#.#', '#.#', '#.#', '.#.'], 'P': ['##.', '#.#', '##.', '#..', '#..'],
+  'Q': ['.#.', '#.#', '#.#', '##.', '.##'], 'R': ['##.', '#.#', '##.', '#.#', '#.#'],
+  'S': ['.##', '#..', '.#.', '..#', '##.'], 'T': ['###', '.#.', '.#.', '.#.', '.#.'],
+  'U': ['#.#', '#.#', '#.#', '#.#', '###'], 'V': ['#.#', '#.#', '#.#', '#.#', '.#.'],
+  'W': ['#.#', '#.#', '###', '###', '#.#'], 'X': ['#.#', '#.#', '.#.', '#.#', '#.#'],
+  'Y': ['#.#', '#.#', '.#.', '.#.', '.#.'], 'Z': ['###', '..#', '.#.', '#..', '###'],
+  '0': ['###', '#.#', '#.#', '#.#', '###'], '1': ['.#.', '##.', '.#.', '.#.', '###'],
+  '2': ['##.', '..#', '.#.', '#..', '###'], '3': ['##.', '..#', '.##', '..#', '##.'],
+  '4': ['#.#', '#.#', '###', '..#', '..#'], '5': ['###', '#..', '##.', '..#', '##.'],
+  '6': ['.##', '#..', '###', '#.#', '###'], '7': ['###', '..#', '.#.', '.#.', '.#.'],
+  '8': ['###', '#.#', '###', '#.#', '###'], '9': ['###', '#.#', '###', '..#', '##.'],
+  '!': ['.#.', '.#.', '.#.', '...', '.#.'], '?': ['##.', '..#', '.#.', '...', '.#.'],
+  '.': ['...', '...', '...', '...', '.#.'], ',': ['...', '...', '...', '.#.', '#..'],
+  '-': ['...', '...', '###', '...', '...'], ':': ['...', '.#.', '...', '.#.', '...'],
+  '/': ['..#', '..#', '.#.', '#..', '#..'], '+': ['...', '.#.', '###', '.#.', '...'],
+  '%': ['#.#', '..#', '.#.', '#..', '#.#'], '&': ['##.', '#.#', '.#.', '#.#', '.##'],
+  "'": ['.#.', '.#.', '...', '...', '...'], '>': ['#..', '.#.', '..#', '.#.', '#..'],
+  '<': ['..#', '.#.', '#..', '.#.', '..#'], '*': ['...', '#.#', '.#.', '#.#', '...'],
+  '(': ['..#', '.#.', '.#.', '.#.', '..#'], ')': ['#..', '.#.', '.#.', '.#.', '#..'],
+  ' ': ['...', '...', '...', '...', '...']
+};
+
+function glyphs(str, x, y, col, s) {
+  g.fillStyle = col;
+  for (let i = 0; i < str.length; i++) {
+    const gl = FONT[str[i]] || FONT['?'];
+    const ox = x + i * 4 * s;
+    for (let r = 0; r < 5; r++) {
+      const row = gl[r];
+      for (let c = 0; c < 3; c++) if (row[c] === '#') g.fillRect(ox + c * s, y + r * s, s, s);
+    }
+  }
+}
+function textW(str, s = 1) { return (String(str).length * 4 - 1) * s; }
+function text(str, x, y, col = '#fff', s = 1, align = 'l', shadow = true) {
+  str = String(str).toUpperCase();
+  const w = textW(str, s);
+  const x0 = align === 'c' ? Math.round(x - w / 2) : align === 'r' ? x - w : x;
+  if (shadow) glyphs(str, x0 + s, y + s, '#140a1c', s);
+  glyphs(str, x0, y, col, s);
+  return w;
+}
+function panel(x, y, w, h, a = 0.72) {
+  g.fillStyle = `rgba(8,4,14,${a})`;
+  g.fillRect(x, y, w, h);
+}
+function drawSky(top, bottom) {
+  const gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, top);
+  gr.addColorStop(1, bottom);
+  g.fillStyle = gr;
+  g.fillRect(0, 0, W, H);
+}
+
+// ============================================================
+// 3. INPUT - keyboard, gamepad and on-screen touch share one action map
+// ============================================================
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'jump', KeyZ: 'jump', KeyX: 'fire', KeyJ: 'fire', ControlLeft: 'fire', ControlRight: 'fire',
+  KeyG: 'grenade', KeyC: 'grenade', KeyK: 'knife', KeyV: 'knife', KeyE: 'use', KeyQ: 'weapon',
+  Enter: 'start', KeyP: 'pause', Escape: 'pause', KeyM: 'mute'
+};
+const srcState = { kb: {}, pad: {}, touch: {} };
+const held = {};
+const edge = {};
+
+function setSrc(src, a, on) {
+  srcState[src][a] = on;
+  const now = !!(srcState.kb[a] || srcState.pad[a] || srcState.touch[a]);
+  if (now && !held[a]) edge[a] = true;          // rising edge = a fresh press
+  held[a] = now;
+}
+// True once per press; consumed by whoever asks first.
+function pressed(a) {
+  if (edge[a]) { edge[a] = false; return true; }
+  return false;
+}
+function clearEdges() { for (const k in edge) edge[k] = false; }
+
+addEventListener('keydown', e => {
+  const a = KEYMAP[e.code];
+  if (!a) return;
+  e.preventDefault();
+  if (e.repeat) return;
+  setSrc('kb', a, true);
+  SND.unlock();
+});
+addEventListener('keyup', e => {
+  const a = KEYMAP[e.code];
+  if (a) setSrc('kb', a, false);
+});
+addEventListener('blur', () => { for (const a in srcState.kb) setSrc('kb', a, false); });
+
+function pollPad() {
+  const list = navigator.getGamepads ? navigator.getGamepads() : [];
+  let p = null;
+  for (const q of list) if (q && q.connected) { p = q; break; }
+  const on = {};
+  if (p) {
+    const b = i => !!(p.buttons[i] && p.buttons[i].pressed);
+    const ax = p.axes[0] || 0, ay = p.axes[1] || 0;
+    on.left = ax < -0.4 || b(14);
+    on.right = ax > 0.4 || b(15);
+    on.up = ay < -0.5 || b(12);
+    on.down = ay > 0.5 || b(13);
+    on.jump = b(0);
+    on.grenade = b(1);
+    on.fire = b(2);
+    on.knife = b(3);
+    on.weapon = b(4) || b(5);
+    on.mute = b(8);
+    on.start = b(9);
+    on.pause = b(9);
+    on.use = b(10);
+  }
+  for (const a of ['left', 'right', 'up', 'down', 'jump', 'fire', 'grenade', 'knife', 'weapon', 'use', 'mute', 'start', 'pause']) {
+    setSrc('pad', a, !!on[a]);
+  }
+}
+
+function setupTouch() {
+  if (matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0) document.body.classList.add('touch');
+  document.querySelectorAll('#touch .b, #sys .b').forEach(el => {
+    const a = el.dataset.a;
+    const down = e => { e.preventDefault(); setSrc('touch', a, true); el.classList.add('on'); SND.unlock(); };
+    const up = e => { e.preventDefault(); setSrc('touch', a, false); el.classList.remove('on'); };
+    el.addEventListener('pointerdown', down);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+    el.addEventListener('pointerleave', up);
+    el.addEventListener('contextmenu', e => e.preventDefault());
+  });
+}
+
+// ============================================================
+// 4. SPRITES - every picture is painted with code, thresholded and outlined
+// ============================================================
+const INK = [22, 11, 29, 255];
+const SPR = {};
+
+function pen(c, ox, oy) {
+  return {
+    r(a, b, w, h, col) { c.fillStyle = col; c.fillRect(ox + a, oy + b, w, h); },
+    dot(a, b, rad, col) { c.fillStyle = col; c.beginPath(); c.arc(ox + a, oy + b, rad, 0, Math.PI * 2); c.fill(); },
+    line(a, b, a2, b2, w, col) {
+      c.strokeStyle = col; c.lineWidth = w; c.lineCap = 'round';
+      c.beginPath(); c.moveTo(ox + a, oy + b); c.lineTo(ox + a2, oy + b2); c.stroke();
+    },
+    poly(pts, col) {
+      c.fillStyle = col; c.beginPath();
+      pts.forEach((q, i) => (i ? c.lineTo(ox + q[0], oy + q[1]) : c.moveTo(ox + q[0], oy + q[1])));
+      c.closePath(); c.fill();
+    }
+  };
+}
+
+// Paints a sprite once (cached by key), snaps alpha to hard pixels and adds a bold ink outline.
+function sprite(key, w, h, paint) {
+  if (SPR[key]) return SPR[key];
+  const P = 2, cw = w + P * 2, ch = h + P * 2;
+  const cvs = document.createElement('canvas');
+  cvs.width = cw; cvs.height = ch;
+  const x = cvs.getContext('2d');
+  paint(pen(x, P, P));
+  const d = x.getImageData(0, 0, cw, ch), src = d.data;
+  for (let i = 3; i < src.length; i += 4) src[i] = src[i] > 127 ? 255 : 0;
+  const out = new Uint8ClampedArray(src);
+  for (let py = 0; py < ch; py++) {
+    for (let px = 0; px < cw; px++) {
+      const i = (py * cw + px) * 4;
+      if (src[i + 3]) continue;
+      let near = false;
+      for (let dy = -1; dy <= 1 && !near; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = px + dx, ny = py + dy;
+          if (nx >= 0 && ny >= 0 && nx < cw && ny < ch && src[(ny * cw + nx) * 4 + 3]) { near = true; break; }
+        }
+      }
+      if (near) { out[i] = INK[0]; out[i + 1] = INK[1]; out[i + 2] = INK[2]; out[i + 3] = 255; }
+    }
+  }
+  x.putImageData(new ImageData(out, cw, ch), 0, 0);
+  return (SPR[key] = { c: cvs, w, h, P, f: null });
+}
+
+// White silhouette of a sprite, used for hit flashes.
+function flashOf(s) {
+  if (s.f) return s.f;
+  const cvs = document.createElement('canvas');
+  cvs.width = s.c.width; cvs.height = s.c.height;
+  const x = cvs.getContext('2d');
+  x.drawImage(s.c, 0, 0);
+  x.globalCompositeOperation = 'source-atop';
+  x.fillStyle = '#ffffff';
+  x.fillRect(0, 0, cvs.width, cvs.height);
+  return (s.f = cvs);
+}
+
+// Draws a sprite with its bottom-centre at (x, y). flip mirrors it, ang rotates it around its centre.
+function blit(s, x, y, flip = 1, ang = 0, flash = false) {
+  const img = flash ? flashOf(s) : s.c;
+  const P = s.P, px = Math.round(x), py = Math.round(y);
+  if (flip === 1 && !ang) {
+    g.drawImage(img, px - Math.floor(s.w / 2) - P, py - s.h - P);
+    return;
+  }
+  g.save();
+  g.translate(px, py - s.h / 2);
+  g.scale(flip, 1);
+  if (ang) g.rotate(ang);
+  g.drawImage(img, -Math.floor(s.w / 2) - P, -Math.floor(s.h / 2) - P);
+  g.restore();
+}
+
+// ============================================================
+// 5. SCENES AND MAIN LOOP
+// ============================================================
+let scene = null;
+function go(s) {
+  scene = s;
+  if (s.init) s.init();
+}
+
+// Fully synthesised audio: oscillators and noise for effects, a step sequencer for the music.
+const SND = (() => {
+  let ac = null, out = null, sfx = null, mus = null, noiseBuf = null;
+  let muted = store.get('muted', false);
+  let track = null, timer = null, nextT = 0, step = 0, bar = 0;
+
+  const TRACKS = {
+    menu: { bpm: 112, bass: 'triangle', lead: 'triangle', drums: false,
+      prog: [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]] },
+    action: { bpm: 150, bass: 'sawtooth', lead: 'square', drums: true,
+      prog: [[45, 48, 52], [41, 45, 48], [48, 52, 55], [43, 47, 50]] },
+    boss: { bpm: 172, bass: 'sawtooth', lead: 'square', drums: true, heavy: true,
+      prog: [[40, 43, 47], [38, 42, 45], [36, 40, 43], [38, 41, 45]] }
+  };
+  const mtof = n => 440 * Math.pow(2, (n - 69) / 12);
+
+  function unlock() {
+    if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    out = ac.createGain(); out.gain.value = muted ? 0 : 0.8; out.connect(ac.destination);
+    sfx = ac.createGain(); sfx.gain.value = 0.75; sfx.connect(out);
+    mus = ac.createGain(); mus.gain.value = 0.2; mus.connect(out);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate * 1.5, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    if (track) startTimer();
+  }
+  function tone(type, f1, f2, t0, dur, vol, bus = sfx) {
+    if (!ac) return;
+    const o = ac.createOscillator(), amp = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t0);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(Math.max(30, f2), t0 + dur);
+    amp.gain.setValueAtTime(vol, t0);
+    amp.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(amp); amp.connect(bus);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+  function noise(t0, dur, vol, f1, f2 = f1, type = 'lowpass', bus = sfx) {
+    if (!ac) return;
+    const s = ac.createBufferSource(), flt = ac.createBiquadFilter(), amp = ac.createGain();
+    s.buffer = noiseBuf;
+    flt.type = type;
+    flt.frequency.setValueAtTime(f1, t0);
+    if (f2 !== f1) flt.frequency.exponentialRampToValueAtTime(Math.max(40, f2), t0 + dur);
+    amp.gain.setValueAtTime(vol, t0);
+    amp.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(flt); flt.connect(amp); amp.connect(bus);
+    s.start(t0, Math.random() * 0.6, dur + 0.05);
+  }
+  const now = () => (ac ? ac.currentTime : 0);
+
+  // ---- effects
+  function shot(kind) {
+    const t = now();
+    if (kind === 'pistol') { tone('square', 880, 220, t, 0.08, 0.12); noise(t, 0.05, 0.25, 3000); }
+    else if (kind === 'mg') { tone('square', 700, 300, t, 0.04, 0.07); noise(t, 0.03, 0.12, 2500); }
+    else if (kind === 'spread') { noise(t, 0.16, 0.4, 1800, 300); tone('sawtooth', 300, 120, t, 0.16, 0.1); }
+    else if (kind === 'flame') noise(t, 0.28, 0.22, 500, 2200, 'bandpass');
+    else if (kind === 'rocket') { noise(t, 0.35, 0.35, 600, 80); tone('sawtooth', 200, 60, t, 0.3, 0.14); }
+    else if (kind === 'laser') { tone('sawtooth', 1200, 200, t, 0.22, 0.12); tone('sine', 2400, 800, t, 0.2, 0.05); }
+    else if (kind === 'sniper') tone('triangle', 1400, 200, t, 0.12, 0.16);
+    else tone('square', 520, 300, t, 0.05, 0.05);
+  }
+  function boom(size) {
+    const t = now(), v = Math.min(0.9, 0.3 + size / 60);
+    noise(t, 0.3 + size / 200, v, 1400, 60);
+    tone('sine', 110, 35, t, 0.4, v * 0.6);
+  }
+  function jump() { tone('square', 300, 620, now(), 0.12, 0.08); }
+  function land() { tone('sine', 140, 60, now(), 0.1, 0.18); }
+  function step_() { noise(now(), 0.03, 0.05, 900, 300); }
+  function hit() { const t = now(); tone('square', 600, 200, t, 0.05, 0.06); noise(t, 0.04, 0.12, 2000); }
+  function voice(kind) {
+    const t = now(), base = kind === 'heavy' ? 260 : 480 + Math.random() * 220;
+    tone('sawtooth', base, base * 0.45, t, 0.34, 0.08);
+  }
+  function pickup() {
+    const t = now();
+    tone('triangle', 660, 660, t, 0.08, 0.12); tone('triangle', 880, 880, t + 0.07, 0.08, 0.12); tone('triangle', 1320, 1320, t + 0.14, 0.12, 0.12);
+  }
+  function rescue() {
+    const t = now();
+    [523, 659, 784, 1046].forEach((f, i) => tone('triangle', f, f, t + i * 0.1, 0.16, 0.13));
+  }
+  function roar() { const t = now(); tone('sawtooth', 90, 40, t, 1.1, 0.35); noise(t, 1.0, 0.3, 500, 120); }
+  function ui() { tone('square', 880, 1320, now(), 0.08, 0.08); }
+  function die() { tone('sawtooth', 600, 90, now(), 0.6, 0.15); }
+  function crate() { const t = now(); noise(t, 0.12, 0.3, 2500, 800); tone('square', 300, 180, t, 0.1, 0.1); }
+  function crack() { noise(now(), 0.12, 0.35, 1800, 400); }
+  function knife() { noise(now(), 0.15, 0.25, 4000, 1500, 'highpass'); }
+  function throwSfx() { noise(now(), 0.12, 0.12, 2000, 800, 'bandpass'); }
+  function crush() { const t = now(); noise(t, 0.25, 0.4, 500, 80); tone('sine', 120, 40, t, 0.25, 0.3); }
+  function hurt() { const t = now(); tone('square', 400, 120, t, 0.2, 0.15); noise(t, 0.1, 0.2, 1200, 300); }
+
+  // ---- music: a 16-step sequencer that schedules notes slightly ahead of the audio clock
+  function playStep(tr, s, t, sp) {
+    const chord = tr.prog[bar], root = chord[0] - 12;
+    if (s % 4 === 0) tone(tr.bass, mtof(root), mtof(root), t, sp * 3.5, tr.heavy ? 0.2 : 0.12, mus);
+    if (s % 4 === 2) tone(tr.bass, mtof(root + 12), mtof(root + 12), t, sp * 1.5, 0.06, mus);
+    if (s % 2 === 0) {
+      const n = chord[(s / 2) % 3] + (s % 8 === 6 ? 12 : 0);
+      tone(tr.lead, mtof(n + 12), mtof(n + 12), t, sp * 1.8, tr.heavy ? 0.05 : 0.045, mus);
+    }
+    if (tr.drums) {
+      if (s === 0 || s === 8 || (tr.heavy && s === 10)) tone('sine', 120, 40, t, 0.15, 0.6, mus);
+      if (s === 4 || s === 12) { noise(t, 0.12, 0.3, 1800, 900, 'bandpass'); tone('triangle', 180, 120, t, 0.1, 0.15, mus); }
+      if (s % 2 === 1) noise(t, 0.03, tr.heavy ? 0.1 : 0.07, 6000, 3000, 'highpass', mus);
+    }
+  }
+  function schedule() {
+    const tr = TRACKS[track];
+    if (!ac || !tr) return;
+    const sp = 60 / tr.bpm / 4;
+    while (nextT < ac.currentTime + 0.12) {
+      playStep(tr, step, nextT, sp);
+      nextT += sp;
+      step = (step + 1) % 16;
+      if (step === 0) bar = (bar + 1) % tr.prog.length;
+    }
+  }
+  function startTimer() {
+    if (!timer) timer = setInterval(schedule, 25);
+    nextT = ac.currentTime + 0.05; step = 0; bar = 0;
+  }
+  function music(name) {
+    if (name === track) return;
+    track = name || null;
+    if (!ac) return;
+    if (track) startTimer();
+  }
+  function toggleMute() {
+    muted = !muted;
+    store.set('muted', muted);
+    if (out) out.gain.setValueAtTime(muted ? 0 : 0.8, now());
+    G.msg = { text: muted ? 'MUTED' : 'SOUND ON', t: 1 };
+  }
+
+  return {
+    unlock, music, toggleMute, shot, boom, jump, land, step: step_, hit, voice, pickup, rescue, roar, ui,
+    die, crate, crack, knife, throw: throwSfx, crush, hurt
+  };
+})();
+
+const Title = {
+  t: 0,
+  init() {
+    this.t = 0;
+    G.hi = store.get('hi', 0);
+    if (!BG.length) buildBackgrounds();
+    SND.music('menu');
+  },
+  update(dt) {
+    this.t += dt;
+    if (pressed('start') || pressed('jump') || pressed('fire')) newGame();
+  },
+  draw() {
+    const z = BG[0];
+    g.drawImage(z.sky, 0, 0);
+    for (let x = -Math.floor(this.t * 10) % 256; x < W; x += 256) g.drawImage(z.far, x, 150 - z.far.height);
+    for (let x = -Math.floor(this.t * 26) % 256; x < W; x += 256) g.drawImage(z.mid, x, 178 - z.mid.height);
+    g.fillStyle = '#e8a050'; g.fillRect(0, 184, W, H - 184);
+    textWave('DUST &', W / 2, 14, 5, this.t);
+    textWave('DYNAMITE', W / 2, 50, 5, this.t + 0.5);
+    text('A RUN & GUN ADVENTURE', W / 2, 96, '#ffe9a8', 1, 'c');
+    if (Math.floor(this.t * 2) % 2 === 0) text('PRESS START', W / 2, 116, '#ffffff', 2, 'c');
+    panel(14, 132, 356, 62, 0.6);
+    text('MOVE ARROWS/WASD   JUMP SPACE/Z   FIRE X/J', W / 2, 137, '#ffffff', 1, 'c');
+    text('AIM UP/DOWN   GRENADE G/C   KNIFE K/V', W / 2, 149, '#ffffff', 1, 'c');
+    text('WEAPON Q   ENTER/EXIT TANK E   PAUSE P/ESC   MUTE M', W / 2, 161, '#ffffff', 1, 'c');
+    text('HI SCORE ' + pad(G.hi, 6), W / 2, 202, '#ffd34d', 1, 'c');
+  }
+};
+
+function step(dt) {
+  T += dt;
+  pollPad();
+  if (pressed('mute')) SND.toggleMute();
+  scene.update(dt);
+  clearEdges();
+}
+
+let lastNow = 0, acc = 0;
+function frame(now) {
+  acc += Math.min(0.25, (now - lastNow) / 1000);
+  lastNow = now;
+  while (acc >= STEP) { step(STEP); acc -= STEP; }
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, W, H);
+  scene.draw();
+  requestAnimationFrame(frame);
+}
+
+// ============================================================
+// 6. WORLD BASICS - tile map and collision
+// ============================================================
+let LW = 0, TW = 0;                  // level width in pixels and tiles
+let MAP = new Uint8Array(0);         // tile types, row-major
+let camX = 0;                        // camera left edge (pixels)
+// Tile types: 0 air, 1 solid rock, 2 one-way platform, 3 ladder, 4 breakable wall, 5 cover (solid)
+const isSolid = t => t === 1 || t === 4 || t === 5;
+const scrX = x => x - Math.round(camX);
+
+function tileAt(tx, ty) {
+  if (tx < 0 || tx >= TW) return 1;          // level edges are walls
+  if (ty < 0 || ty >= TH) return 0;          // open sky above, empty pit below
+  return MAP[ty * TW + tx];
+}
+function solidOverlap(b) {
+  const x0 = Math.floor(b.l / TS), x1 = Math.floor((b.r - 0.01) / TS);
+  const y0 = Math.floor(b.t / TS), y1 = Math.floor((b.b - 0.01) / TS);
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) if (isSolid(tileAt(tx, ty))) return true;
+  return false;
+}
+function platformUnder(b, row) {
+  const x0 = Math.floor(b.l / TS), x1 = Math.floor((b.r - 0.01) / TS);
+  for (let tx = x0; tx <= x1; tx++) if (tileAt(tx, row) === 2) return true;
+  return false;
+}
+// Moves an entity sideways one pixel at a time. Returns true when a wall stops it.
+function moveX(e, dx) {
+  let rem = dx;
+  while (Math.abs(rem) > 1e-6) {
+    const s = sgn(rem) * Math.min(1, Math.abs(rem));
+    rem -= s;
+    e.x += s;
+    if (solidOverlap(boxOf(e))) { e.x -= s; return true; }
+  }
+  return false;
+}
+// Moves an entity vertically. Sets e.onGround and lands on solids and one-way platforms.
+function moveY(e, dy) {
+  e.onGround = false;
+  let rem = dy;
+  while (Math.abs(rem) > 1e-6) {
+    const s = sgn(rem) * Math.min(1, Math.abs(rem));
+    rem -= s;
+    const prev = e.y;
+    e.y += s;
+    if (s > 0) {
+      const top = Math.ceil(prev / TS) * TS;          // surface the feet may have crossed
+      if (top <= e.y + 1e-6 && platformUnder(boxOf(e), top / TS)) {
+        e.y = top; e.onGround = true; e.vy = 0; return;
+      }
+    }
+    if (solidOverlap(boxOf(e))) {
+      e.y = prev; e.vy = 0;
+      if (s > 0) e.onGround = true;
+      return;
+    }
+  }
+}
+
+// ============================================================
+// 7. PARTICLES - dust, sparks and smoke share one lightweight system
+// ============================================================
+const parts = [];
+function spawnPart(x, y, vx, vy, life, col, size = 1.5, grav = 0, drag = 0, kind = 'sq') {
+  parts.push({ x, y, vx, vy, life, max: life, col, size, grav, drag, kind });
+}
+function updParts(dt) {
+  for (const p of parts) {
+    p.life -= dt;
+    p.vy += p.grav * dt;
+    const k = Math.exp(-p.drag * dt);
+    p.vx *= k; p.vy *= k;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.kind === 'shell' && p.y > GROUND_Y) { p.y = GROUND_Y; p.vy = -p.vy * 0.35; p.vx *= 0.6; }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) if (parts[i].life <= 0) parts.splice(i, 1);
+}
+function drawParts() {
+  for (const p of parts) {
+    const a = p.life / p.max;
+    g.globalAlpha = p.kind === 'smoke' ? Math.min(1, a * 1.4) : 1;
+    g.fillStyle = p.col;
+    const s = p.kind === 'smoke' ? p.size * (1.7 - a) : p.size;
+    const sz = Math.max(1, Math.round(s));
+    g.fillRect(Math.round(scrX(p.x) - sz / 2), Math.round(p.y - sz / 2), sz, sz);
+  }
+  g.globalAlpha = 1;
+}
+function dust(x, y, n, col = '#e7c995') {
+  for (let i = 0; i < n; i++) spawnPart(x + rr(-3, 3), y - 1, rr(-30, 30), rr(-45, -10), rr(0.3, 0.6), col, rr(1, 2), 90, 4);
+}
+
+// ============================================================
+// 8. PLAYER - physics, controls and procedural commando animation
+// ============================================================
+const RUN = 92, CRAWL = 34, JUMP_V = -215;
+const P = {
+  x: 40, y: GROUND_Y, vx: 0, vy: 0, w: 9, h: 16, face: 1,
+  onGround: false, wasOnGround: false, crouch: false, climbing: false, jumping: false,
+  hp: 3, inv: 0, hurtT: 0, dead: false, deadT: 0, ang: 0, spin: 0,
+  coyote: 0, jbuf: 0, runPh: 0, idleT: 0, fid: 0, stepT: 0,
+  aimAng: null, shootT: 9, knifeT: 0, throwT: 0, victory: false,
+  fireCD: 0, flashT: 0, shield: 0
+};
+
+function headBlocked() {
+  return solidOverlap({ l: P.x - 4.5, r: P.x + 4.5, t: P.y - 16, b: P.y });
+}
+
+function updPlayer(dt) {
+  if (P.dead) { updDeadPlayer(dt); return; }
+  if (P.inTank) { P.inv = Math.max(0, P.inv - dt); P.x = TANK.x; P.y = TANK.y; return; }
+  P.inv = Math.max(0, P.inv - dt);
+  P.shield = Math.max(0, P.shield - dt);
+  P.hurtT = Math.max(0, P.hurtT - dt);
+  P.shootT += dt;
+  P.knifeT = Math.max(0, P.knifeT - dt);
+  P.throwT = Math.max(0, P.throwT - dt);
+
+  const up = held.up, down = held.down;
+  const ax = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+
+  // jump buffer (press shortly before landing) and coyote time (jump shortly after leaving a ledge)
+  if (pressed('jump')) P.jbuf = 0.12;
+  P.jbuf = Math.max(0, P.jbuf - dt);
+  P.coyote = P.onGround ? 0.1 : Math.max(0, P.coyote - dt);
+  P.wasOnGround = P.onGround;
+
+  // ladders: the ladder tile at body height lets the player climb with up/down
+  const onLadder = tileAt(Math.floor(P.x / TS), Math.floor((P.y - 8) / TS)) === 3;
+  if (!onLadder) P.climbing = false;
+  else if ((up || down) && !P.climbing && !P.jumping) P.climbing = true;
+
+  if (P.jbuf > 0 && (P.onGround || P.coyote > 0 || P.climbing)) {
+    P.climbing = false; P.jbuf = 0; P.coyote = 0;
+    P.vy = JUMP_V; P.jumping = true; P.onGround = false;
+    dust(P.x, P.y, 3);
+    SND.jump();
+  }
+  if (P.jumping && !held.jump && P.vy < -95) P.vy = -95;   // releasing jump cuts the rise short
+  if (P.vy >= 0) P.jumping = false;
+
+  // crouch while standing still on the ground; stand back up only with headroom
+  if (down && P.onGround && !P.climbing) P.crouch = true;
+  else if (P.crouch && !headBlocked()) P.crouch = false;
+  P.h = P.crouch ? 10 : 16;
+
+  // horizontal movement with quick acceleration on the ground and slower control in the air
+  const maxV = P.crouch ? CRAWL : RUN;
+  const target = P.climbing ? 0 : ax * maxV;
+  P.vx = approach(P.vx, target, (P.onGround ? 1000 : 600) * dt);
+  if (ax && !P.climbing) P.face = ax;
+  if (moveX(P, P.vx * dt)) P.vx = 0;
+  P.x = clamp(P.x, 6, LW - 6);
+
+  // vertical movement: gravity, or steady climbing on a ladder
+  if (P.climbing) {
+    P.vy = 0;
+    moveY(P, ((down ? 1 : 0) - (up ? 1 : 0)) * 72 * dt);
+  } else {
+    P.vy = Math.min(P.vy + GRAV * dt, MAX_FALL);
+    moveY(P, P.vy * dt);
+  }
+  if (P.onGround && !P.wasOnGround) { dust(P.x, P.y, 5); SND.land(); }
+  if (P.y > TH * TS + 16) { killPlayer('pit'); return; }
+
+  // footsteps and running dust
+  const moving = P.onGround && Math.abs(P.vx) > 4;
+  if (moving) {
+    P.runPh += dt * Math.abs(P.vx) * (P.crouch ? 0.13 : 0.11);
+    P.stepT -= dt;
+    if (P.stepT <= 0) {
+      P.stepT = P.crouch ? 0.36 : 0.26;
+      dust(P.x - P.face * 3, P.y, 1);
+      SND.step();
+    }
+  } else if (P.onGround && !P.crouch) {
+    P.idleT += dt;
+    if (P.idleT > 3.5) { P.idleT = 0; P.fid = 0.4; }   // small head fidget while idle
+  }
+  P.fid = Math.max(0, P.fid - dt);
+
+  // aiming: up, diagonal up, down while airborne (diagonal when moving)
+  let aim = null;
+  if (up && !down) aim = ax ? -Math.PI / 4 : -Math.PI / 2;
+  else if (down && !P.onGround) aim = ax ? Math.PI / 4 : Math.PI / 2;
+  P.aimAng = aim;
+}
+
+function killPlayer(cause) {
+  if (P.dead) return;
+  P.dead = true; P.deadT = 0; P.hp = 0; P.ang = 0;
+  P.spin = P.face * 11;
+  P.vy = cause === 'pit' ? -60 : -260;
+  P.vx = cause === 'pit' ? 0 : -P.face * 60;
+  SND.die();
+}
+function updDeadPlayer(dt) {
+  P.deadT += dt;
+  P.ang += P.spin * dt;
+  if (P.onGround) P.spin *= 0.85;
+  P.vy = Math.min(P.vy + GRAV * dt, MAX_FALL);
+  moveX(P, P.vx * dt);
+  moveY(P, P.vy * dt);
+  if (P.onGround) P.vx *= 0.9;
+  if (P.deadT > 2) afterDeath();
+}
+function respawnPlayer() {
+  Object.assign(P, {
+    x: 40, y: GROUND_Y, vx: 0, vy: 0, face: 1, h: 16, dead: false, deadT: 0, ang: 0, spin: 0,
+    hp: 3, inv: 1.5, hurtT: 0, climbing: false, jumping: false, crouch: false, onGround: false,
+    inTank: false, shield: 0, victory: false
+  });
+  camX = 0;
+}
+function hurtPlayer(d, dir) {
+  if (P.inv > 0 || P.dead || P.shield > 0 || P.inTank) return;
+  P.hp -= d;
+  P.inv = 1.4; P.hurtT = 0.35; hurtFlash = 0.25;
+  P.vx = dir * 110; P.vy = -150;
+  SND.hurt();
+  if (P.hp <= 0) killPlayer('shot');
+}
+
+// Pose tables for the commando, drawn facing right and mirrored for left.
+const CMD = {
+  skin: '#f2b98c', skinD: '#d98d62', shirt: '#7f8f3a', shirtD: '#56631f',
+  pants: '#50683a', pantsD: '#34452a', boot: '#3a2619', belt: '#6b4526',
+  red: '#e53b2f', redD: '#a8261d', shade: '#15151f', gun: '#2e2f3a',
+  blade: '#e8edf5', gren: '#3f5a2a'
+};
+// Arm from shoulder (sx, sy) through elbow to hand. Angles: 0 forward, PI/2 down, -PI/2 up.
+function paintArm(p, sx, sy, ang, sleeve, hold, skin = CMD.skin) {
+  const ex = sx + Math.cos(ang) * 3.5, ey = sy + Math.sin(ang) * 3.5;
+  const hx = ex + Math.cos(ang) * 3.2, hy = ey + Math.sin(ang) * 3.2;
+  p.line(sx, sy, ex, ey, 2.8, sleeve);
+  p.line(ex, ey, hx, hy, 2.2, skin);
+  p.dot(hx, hy, 1.3, skin);
+  const fx = hx + Math.cos(ang) * 4.5, fy = hy + Math.sin(ang) * 4.5;
+  if (hold === 'gun') p.line(hx, hy, fx, fy, 2.2, CMD.gun);
+  else if (hold === 'rifle') p.line(hx, hy, hx + Math.cos(ang) * 11, hy + Math.sin(ang) * 11, 1.8, CMD.gun);
+  else if (hold === 'knife') p.line(hx, hy, fx, fy, 1.4, CMD.blade);
+  else if (hold === 'gren') p.dot(hx, hy, 1.8, CMD.gren);
+}
+function paintLeg(p, hx, hy, fx, fy, pants, boot = CMD.boot) {
+  const kx = (hx + fx) / 2 + (fx >= hx ? 0.8 : -0.8), ky = (hy + fy) / 2;
+  p.line(hx, hy, kx, ky, 3, pants);
+  p.line(kx, ky, fx, fy, 3, pants);
+  p.r(fx - 2, fy - 1, 5, 3, boot);
+}
+function paintCommando(p, s) {
+  const oy = (s.cr ? 3 : 0) - (s.bob || 0);          // crouching lowers the upper body
+  const hold = s.gun ? 'gun' : s.gren ? 'gren' : null;
+  paintArm(p, 7, 11 + oy, s.ab, CMD.shirtD, null);     // back arm (behind the body)
+  paintLeg(p, 8, 16 + oy, s.lb[0], s.lb[1], CMD.pantsD);
+  p.r(6, 10 + oy, 8, 6, CMD.shirt);                    // vest
+  p.r(6, 14 + oy, 8, 2, CMD.belt);
+  paintLeg(p, 12, 16 + oy, s.lf[0], s.lf[1], CMD.pants);
+  paintArm(p, 13, 11 + oy, s.af, CMD.shirt, s.knife ? 'knife' : hold);
+  const hx = 10 + (s.hd || 0), hy = 6 + oy;           // head with red bandana and a tail that flaps
+  p.dot(hx, hy, 3.4, CMD.skin);
+  p.poly([[hx - 3.6, hy - 1.6], [hx + 3.6, hy - 1.6], [hx + 3.6, hy - 0.2], [hx - 3.6, hy + 0.4]], CMD.red);
+  const fl = s.flap || 0;
+  p.poly([[hx - 3.2, hy - 1.2], [hx - 6.6, hy - 2 + fl], [hx - 6.2, hy + 0.6 + fl], [hx - 3.2, hy + 0.9]], CMD.redD);
+  if (s.face === 'x') {                                // dead: X eyes
+    p.line(hx - 0.2, hy - 0.6, hx + 1.4, hy + 1.0, 0.9, CMD.shade);
+    p.line(hx + 1.4, hy - 0.6, hx - 0.2, hy + 1.0, 0.9, CMD.shade);
+    p.dot(hx + 0.6, hy + 2.2, 0.9, CMD.shade);
+  } else if (s.face === 'h') {                         // hurt: squeezed eyes and open mouth
+    p.r(hx + 0.4, hy - 0.2, 2.4, 0.8, CMD.shade);
+    p.dot(hx + 1.4, hy + 2.0, 0.9, CMD.shade);
+  } else if (s.face === 'c') {                         // victory grin behind shades
+    p.r(hx - 0.4, hy - 0.4, 3.8, 1.6, CMD.shade);
+    p.line(hx - 0.2, hy + 2.0, hx + 2.6, hy + 2.0, 0.8, '#fff3d6');
+  } else {                                             // sunglasses
+    p.r(hx - 0.4, hy - 0.4, 3.6, 1.6, CMD.shade);
+  }
+}
+const qa = v => Math.round(v * 10);
+function playerPose() {
+  const moving = P.onGround && Math.abs(P.vx) > 4 && !P.crouch;
+  const s = {
+    cr: P.crouch ? 1 : 0, bob: 0, hd: 0, face: 'n', gun: 0, knife: 0, gren: 0, flap: 0,
+    lf: [12, 21], lb: [8, 21], af: 1.35, ab: 1.9
+  };
+  const airUp = !P.onGround && P.vy < -30, airDown = !P.onGround && !airUp;
+  if (P.victory) { s.face = 'c'; s.af = -2.4; s.ab = -1.8; s.flap = Math.sin(T * 12) * 0.8; }
+  else if (P.hurtT > 0) { s.face = 'h'; s.af = -1.6 + Math.sin(T * 30) * 0.4; s.ab = -2.2 + Math.cos(T * 27) * 0.3; }
+  else if (airUp) { s.lf = [13, 19]; s.lb = [8, 20]; s.af = -0.9; s.ab = -2.2; }      // tucked legs, arms up
+  else if (airDown) { s.lf = [14, 20]; s.lb = [5, 21]; s.af = -0.1; s.ab = 2.5; }     // spread legs, arms out
+  else if (P.crouch) {
+    const k = Math.abs(P.vx) > 4 ? Math.round(Math.sin(P.runPh) * 2) : 0;
+    s.lf = [14 + k, 21]; s.lb = [5 - k, 21];
+  } else if (moving) {
+    const c1 = Math.cos(P.runPh), c2 = -c1, s1 = Math.sin(P.runPh), s2 = -s1;
+    s.lf = [Math.round(12 + c1 * 3), 21 - (s1 > 0 ? Math.round(s1 * 2) : 0)];
+    s.lb = [Math.round(8 + c2 * 3), 21 - (s2 > 0 ? Math.round(s2 * 2) : 0)];
+    s.bob = Math.abs(s1) > 0.8 ? 1 : 0;
+    s.af = 1.35 + c2 * 0.5; s.ab = 1.9 + c1 * 0.5;
+  }
+  if (P.knifeT > 0) { s.knife = 1; s.af = lerp(-1.6, 1.4, 1 - P.knifeT / 0.25); }
+  else if (P.throwT > 0) { s.gren = 1; s.af = lerp(-2.2, 0.1, 1 - P.throwT / 0.22); }
+  else if (P.aimAng !== null || P.shootT < 0.35) {
+    s.gun = 1; s.af = P.aimAng !== null ? P.aimAng : 0; s.ab = s.af + 0.15;
+  }
+  if (P.fid > 0 && !moving && P.onGround) s.hd = 1;
+  if (P.inv > 0 && P.hurtT > 0) s.flap = 1;
+  return s;
+}
+function drawPlayer() {
+  if (P.inTank) return;
+  if (P.dead) {
+    const d = { cr: 0, bob: 0, hd: 0, face: 'x', gun: 0, knife: 0, gren: 0, flap: 1, lf: [14, 20], lb: [5, 20], af: -1.8, ab: -2.4 };
+    const spr = sprite('cmd|dead', 20, 24, p => paintCommando(p, d));
+    blit(spr, scrX(P.x), P.y, 1, P.ang);
+    return;
+  }
+  if (P.inv > 0 && Math.floor(T * 14) % 2 === 0) return;   // blink while invulnerable
+  const s = playerPose();
+  const key = 'cmd|' + [s.cr, s.bob, s.hd, s.face, s.gun, s.knife, s.gren, s.flap,
+    s.lf.join(','), s.lb.join(','), qa(s.af), qa(s.ab)].join('|');
+  const spr = sprite(key, 20, 24, p => paintCommando(p, s));
+  blit(spr, scrX(P.x), P.y, P.face, 0, P.hurtT > 0.25);
+  if (P.flashT > 0) {                                  // muzzle flash: a small star at the barrel
+    const m = muzzle(aimDir()), mx = Math.round(scrX(m.x)), my = Math.round(m.y);
+    g.fillStyle = '#fff6c2'; g.fillRect(mx - 2, my - 1, 4, 2); g.fillRect(mx - 1, my - 2, 2, 4);
+    g.fillStyle = '#ffb347'; g.fillRect(mx - 3, my, 1, 1); g.fillRect(mx + 2, my, 1, 1);
+  }
+}
+
+// ============================================================
+// 10. WORLD - four zones, level layout, tile painting, parallax and triggers
+// ============================================================
+const INK_HEX = '#160b1d';
+const ZONES = [
+  { name: 'SUN-SCORCHED OUTPOST', from: 0, sky: ['#2f8ee0', '#ffe2a0'], far: '#d08a55', mid: '#a9663e', near: '#7d4a2b', sun: '#fff1a6',
+    pal: { style: 'sand', base: '#d6a061', hi: '#f0c77f', lo: '#9d6a3c', top: '#f7d88e', crack: '#6f4327', wood: '#8e5b33', woodHi: '#b57d47', cover: '#e6c17f', coverLo: '#a98650', dust: '#e7c995' } },
+  { name: 'BOMBED-OUT VILLAGE', from: 2000, sky: ['#2b2350', '#ff9a57'], far: '#5a3f63', mid: '#3a2a45', near: '#241a2b', sun: null,
+    pal: { style: 'bldg', base: '#6e5b6e', hi: '#8e7a8e', lo: '#4c3e4f', top: '#9c6a58', crack: '#2d2033', wood: '#6d4a35', woodHi: '#9a6d4d', cover: '#8f8176', coverLo: '#5b5049', dust: '#b9a3a0' } },
+  { name: 'THE DEAD CANYON', from: 4200, sky: ['#0d0716', '#3d1a26'], far: '#2a1730', mid: '#1c0f20', near: '#120912', sun: null,
+    pal: { style: 'rock', base: '#4f3b3d', hi: '#6c5354', lo: '#2c2024', top: '#7e5f5e', crack: '#23161b', wood: '#5b4032', woodHi: '#7d5a45', cover: '#5f4a45', coverLo: '#372a27', dust: '#8a6a5a' } },
+  { name: 'FORTRESS GATE', from: 5800, sky: ['#ff6b3d', '#3d0f2c'], far: '#6a2140', mid: '#43132f', near: '#25091c', sun: '#ffd27a',
+    pal: { style: 'steel', base: '#5b6273', hi: '#7f8798', lo: '#3a404f', top: '#9aa3b4', crack: '#262b38', wood: '#5b4a3e', woodHi: '#7b6656', cover: '#7b8396', coverLo: '#4c5366', dust: '#9aa3b4' } }
+];
+let LV = null, FG = null, LVc = null, FGc = null;      // back tiles and front cover tiles
+let BG = [];                                           // per-zone sky and parallax strips
+let LEV = null;                                        // level data: triggers, pickups, decor
+let BIRDS = [];
+const G = {
+  score: 0, lives: 3, credits: 3, rescued: 0, zone: -1, lock: null, banner: null, msg: null, done: new Set(), ck: null,
+  weapon: 'pistol', ammo: { pistol: Infinity, mg: 0, spread: 0, flame: 0, rocket: 0, laser: 0 }, grenades: 5,
+  hi: 0, levelT: 0, paused: false
+};
+
+const makeCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const zoneAt = px => { let z = 0; for (let i = 0; i < ZONES.length; i++) if (px >= ZONES[i].from) z = i; return z; };
+function setRect(x0, y0, x1, y1, t) {
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) MAP[ty * TW + tx] = t;
+}
+
+function buildLevel() {
+  LW = 6184; TW = LW / TS;
+  MAP = new Uint8Array(TW * TH);
+  const pit = (x0, x1) => setRect(x0, GROUND, x1, TH - 1, 0);
+  setRect(0, GROUND, TW - 1, TH - 1, 1);
+
+  // zone 1: sun-scorched outpost (tiles 0-249)
+  pit(70, 74); pit(130, 134); pit(196, 200);
+  setRect(131, 20, 133, 20, 2);                  // stepping stone over the second pit (leaves ground beside the secret wall)
+  setRect(84, 19, 86, GROUND - 1, 1);            // crumbling walls
+  setRect(166, 19, 167, GROUND - 1, 1);
+  setRect(176, 19, 179, 19, 2);                  // raised walkway
+  setRect(118, 19, 127, 22, 1);                  // ruined block...
+  setRect(119, 21, 125, 22, 0);                  //   ...with a hidden pocket inside (secret A)
+  setRect(126, 21, 127, 22, 4);                  //   ...sealed by a breakable wall
+  setRect(22, 21, 23, 22, 5); setRect(40, 21, 42, 22, 5); setRect(100, 21, 101, 22, 5);
+  setRect(150, 21, 152, 22, 5); setRect(180, 21, 181, 22, 5);       // sandbag cover
+  setRect(60, 21, 63, 22, 5); setRect(140, 21, 143, 22, 5); setRect(220, 21, 223, 22, 5);   // wrecked cars
+  setRect(186, 15, 190, 22, 1); setRect(185, 15, 185, GROUND - 1, 3);   // outpost tower and its ladder
+
+  // zone 2: bombed-out village (tiles 250-524), multi-height rooftops
+  setRect(252, 21, 253, 22, 5);                  // rubble
+  setRect(263, 13, 275, 22, 1); setRect(262, 13, 262, GROUND - 1, 3);   // house 1 and ladder
+  setRect(276, 15, 279, 15, 2);                  // balcony
+  setRect(280, 17, 292, 22, 1);                  // house 2
+  pit(294, 299); setRect(295, 20, 298, 20, 2);   // pit with a stepping ledge
+  setRect(306, 9, 312, 22, 1); setRect(305, 9, 305, GROUND - 1, 3);     // tower and ladder
+  setRect(313, 14, 316, 14, 2);                  // balcony
+  setRect(317, 18, 326, 22, 1);                  // house 4
+  setRect(328, 19, 337, 22, 1);                  // cellar block...
+  setRect(329, 21, 335, 22, 0);                  //   ...hidden cellar (secret B)
+  setRect(336, 21, 337, 22, 4);                  //   ...breakable entrance
+  setRect(342, 21, 343, 22, 5); setRect(352, 21, 355, 22, 5); setRect(380, 21, 382, 22, 5);
+  setRect(358, 19, 361, 19, 2);                  // ledge
+  setRect(400, 15, 412, 22, 1); setRect(399, 15, 399, GROUND - 1, 3);   // house 5 and ladder
+  setRect(420, 21, 421, 22, 5);
+
+  // zone 3: dead canyon (tiles 525-724), low ceiling; the entrance gap fits the player, not the tank
+  setRect(525, 0, 724, 8, 1);
+  setRect(525, 0, 526, 20, 1);
+  pit(560, 564); pit(640, 643);
+  setRect(596, 6, 597, 8, 4); setRect(668, 6, 669, 8, 4);    // cracked ceiling for burst entrances
+  setRect(544, 21, 546, 22, 5); setRect(620, 20, 623, 22, 5); setRect(690, 21, 692, 22, 5);   // boulders
+
+  // zone 4: fortress gate (tiles 725-772), open sky over the arena
+  setRect(738, 20, 739, 22, 5); setRect(752, 20, 753, 22, 5);
+  setRect(762, 0, TW - 1, 22, 1);                // fortress wall
+
+  LEV = {
+    ckX: 3000,
+    tankX: 3152,
+    locks: [
+      { id: 'L1', trig: 470, cam: 400 },
+      { id: 'L2', trig: 1110, cam: 1080 },
+      { id: 'L3', trig: 1670, cam: 1640 },
+      { id: 'L4', trig: 2290, cam: 2250 },
+      { id: 'L5', trig: 2730, cam: 2700 },
+      { id: 'L6', trig: 3040, cam: 3010 },
+      { id: 'L7', trig: 4590, cam: 4560 },
+      { id: 'L8', trig: 5130, cam: 5100 },
+      { id: 'BOSS', trig: 5820, cam: 5800, boss: true }
+    ],
+    waves: WAVE_DATA,                            // enemies spawned when each lock triggers
+    placed: PLACED.map(p => ({ ...p })),         // ambushers that wake as the camera approaches
+    crates: [
+      { id: 'c1', x: 520, y: GROUND_Y }, { id: 'c2', x: 900, y: GROUND_Y }, { id: 'c3', x: 1260, y: GROUND_Y },
+      { id: 'c4', x: 1820, y: GROUND_Y }, { id: 'c5', x: 2900, y: GROUND_Y }, { id: 'c6', x: 3100, y: GROUND_Y },
+      { id: 'c7', x: 4620, y: GROUND_Y }, { id: 'c8', x: 5020, y: GROUND_Y }, { id: 'c9', x: 5280, y: GROUND_Y }
+    ],
+    captives: [
+      { id: 'k1', x: 1400, y: GROUND_Y, reward: 'mg' }, { id: 'k2', x: 980, y: GROUND_Y, reward: 'laser' },
+      { id: 'k3', x: 2520, y: 112, reward: 'spread' }, { id: 'k4', x: 2660, y: GROUND_Y, reward: 'rocket' },
+      { id: 'k5', x: 5420, y: GROUND_Y, reward: 'flame' }
+    ],
+    items: [
+      { id: 'i1', k: 'medal', x: 300, y: GROUND_Y }, { id: 'i2', k: 'medal', x: 316, y: GROUND_Y },
+      { id: 'i3', k: 'fruit', x: 332, y: GROUND_Y }, { id: 'i4', k: 'gold', x: 964, y: GROUND_Y },
+      { id: 'i5', k: 'gold', x: 988, y: GROUND_Y }, { id: 'i6', k: 'kit', x: 1004, y: GROUND_Y },
+      { id: 'i7', k: 'ammo', x: 1360, y: GROUND_Y }, { id: 'i8', k: 'medal', x: 2420, y: GROUND_Y },
+      { id: 'i9', k: 'shield', x: 2636, y: GROUND_Y }, { id: 'i10', k: 'gold', x: 2652, y: GROUND_Y },
+      { id: 'i11', k: 'gold', x: 2676, y: GROUND_Y }, { id: 'i12', k: 'medal', x: 4900, y: GROUND_Y },
+      { id: 'i13', k: 'medal', x: 4916, y: GROUND_Y }, { id: 'i14', k: 'fruit', x: 4932, y: GROUND_Y },
+      { id: 'i15', k: 'kit', x: 5860, y: GROUND_Y }, { id: 'i16', k: 'ammo', x: 5910, y: GROUND_Y }
+    ],
+    flags: [{ x: 212, y: 112, col: '#e53b2f' }, { x: 1262, y: 112, col: '#e53b2f' }, { x: 2044, y: 112, col: '#3a2a45' }],
+    smoke: [{ x: 2260, y: 136 }, { x: 2490, y: 72 }, { x: 3240, y: 120 }],
+    fires: [{ x: 2064, y: GROUND_Y }, { x: 3376, y: GROUND_Y }]
+  };
+
+  ensureLevelCanvases();
+  LVc.clearRect(0, 0, LW, H); FGc.clearRect(0, 0, LW, H);
+  for (let ty = 0; ty < TH; ty++) for (let tx = 0; tx < TW; tx++) paintTile(tx, ty);
+  paintCactus(264); paintCactus(600); paintCactus(780); paintCactus(1290); paintCactus(1640); paintCactus(1900);
+  paintCar(480); paintCar(1120); paintCar(1760);
+  if (!BG.length) buildBackgrounds();
+  BIRDS = [];
+  for (let i = 0; i < 7; i++) BIRDS.push({ x: rr(0, 4200), y: rr(16, 64), v: rr(14, 22), ph: rr(0, 6) });
+}
+function ensureLevelCanvases() {
+  if (LV) return;
+  LV = makeCanvas(LW, H); LVc = LV.getContext('2d');
+  FG = makeCanvas(LW, H); FGc = FG.getContext('2d');
+}
+
+// Paints one tile into the back (LV) or front (FG, covers only) canvas. Air is left alone so decor survives.
+function paintTile(tx, ty) {
+  const t = tileAt(tx, ty);
+  if (!t) return;
+  const x = tx * TS, y = ty * TS;
+  const pal = ZONES[zoneAt(x)].pal;
+  const h = hash(tx, ty), h2 = hash(ty + 31, tx + 7);
+  const solid = (dx, dy) => isSolid(tileAt(tx + dx, ty + dy));
+  const same = (dx, dy, k) => tileAt(tx + dx, ty + dy) === k;
+  const L = LVc;
+  if (t === 2) {                                           // one-way platform: planks
+    L.fillStyle = pal.wood; L.fillRect(x, y, TS, 3);
+    L.fillStyle = pal.woodHi; L.fillRect(x, y, TS, 1);
+    L.fillStyle = pal.lo; L.fillRect(x + 3 + (h > 0.5 ? 1 : 0), y + 1, 1, 2);
+    L.fillStyle = INK_HEX; L.fillRect(x, y + 3, TS, 1);
+    if (!same(-1, 0, 2)) L.fillRect(x, y, 1, 4);
+    if (!same(1, 0, 2)) L.fillRect(x + 7, y, 1, 4);
+    return;
+  }
+  if (t === 3) {                                           // ladder
+    L.fillStyle = pal.wood;
+    L.fillRect(x + 1, y, 1, TS); L.fillRect(x + 6, y, 1, TS);
+    L.fillRect(x + 1, y + 2, 6, 1); L.fillRect(x + 1, y + 6, 6, 1);
+    return;
+  }
+  if (t === 5) {                                           // cover blocks sit in front of the action
+    const F = FGc;
+    F.fillStyle = pal.cover; F.fillRect(x, y, TS, TS);
+    if (pal.style === 'steel') {
+      for (let k = 0; k < TS; k += 4) { F.fillStyle = k % 8 ? '#e3b43a' : INK_HEX; F.fillRect(x + k, y, 2, TS); }
+    } else if (pal.style === 'sand') {
+      F.fillStyle = pal.coverLo;
+      F.fillRect(x, y + 3, TS, 1); F.fillRect(x, y + 6, TS, 1); F.fillRect(x + (h > 0.5 ? 3 : 5), y, 1, 3);
+    } else {
+      F.fillStyle = pal.coverLo;
+      F.fillRect(x + (h * 5 | 0) + 1, y + (h2 * 5 | 0) + 1, 2, 1); F.fillRect(x + 1, y + 6, 6, 1);
+    }
+    F.fillStyle = INK_HEX;
+    if (!same(-1, 0, 5)) F.fillRect(x, y, 1, TS);
+    if (!same(1, 0, 5)) F.fillRect(x + 7, y, 1, TS);
+    if (!same(0, -1, 5)) F.fillRect(x, y, TS, 1);
+    if (!same(0, 1, 5)) F.fillRect(x, y + 7, TS, 1);
+    return;
+  }
+  // solid rock (1) and breakable wall (4)
+  L.fillStyle = t === 1 ? pal.base : pal.hi;
+  L.fillRect(x, y, TS, TS);
+  if (pal.style === 'sand') {
+    L.fillStyle = pal.lo; L.fillRect(x, y + 3, TS, 1); L.fillRect(x + (ty % 2 ? 2 : 6), y + 4, 1, 3);
+  } else if (pal.style === 'bldg' && t === 1) {
+    if (tx % 4 === 1 && ty % 3 === 1) {                    // window, lit or dark
+      L.fillStyle = INK_HEX; L.fillRect(x + 2, y + 2, 4, 4);
+      L.fillStyle = h2 > 0.45 ? '#ffcf6b' : '#2b2233'; L.fillRect(x + 3, y + 3, 2, 2);
+    } else {
+      L.fillStyle = pal.lo; L.fillRect(x, y + (tx % 2 ? 2 : 6), TS, 1);
+    }
+  } else if (pal.style === 'steel') {
+    L.fillStyle = pal.lo; L.fillRect(x, y + 4, TS, 1);
+    L.fillStyle = pal.hi; L.fillRect(x + 1, y + 1, 1, 1); L.fillRect(x + 6, y + 6, 1, 1);
+  } else {
+    L.fillStyle = pal.lo;
+    L.fillRect(x + (h * 6 | 0) + 1, y + (h2 * 6 | 0) + 1, 1, 1);
+    L.fillRect(x + (h2 * 5 | 0) + 2, y + (h * 5 | 0) + 3, 2, 1);
+  }
+  if (t === 4) {                                           // cracks show the wall is breakable
+    L.fillStyle = pal.crack;
+    L.fillRect(x + 2, y + 1, 1, 2); L.fillRect(x + 3, y + 3, 1, 2); L.fillRect(x + 4, y + 5, 1, 2); L.fillRect(x + 5, y + 6, 1, 1);
+  }
+  if (!solid(0, -1)) { L.fillStyle = pal.top; L.fillRect(x, y, TS, 2); }
+  if (t === 1 && pal.style === 'rock' && ty === 8 && !solid(0, 1) && h > 0.55) {   // stalactite
+    L.fillStyle = pal.base; L.fillRect(x + 2, y + 8, 4, 1); L.fillRect(x + 3, y + 9, 2, 1); L.fillRect(x + 3, y + 10, 1, 1);
+  }
+  L.fillStyle = INK_HEX;                                   // bold outline on every open edge
+  if (!solid(-1, 0)) L.fillRect(x, y, 1, TS);
+  if (!solid(1, 0)) L.fillRect(x + 7, y, 1, TS);
+  if (!solid(0, -1)) L.fillRect(x, y, TS, 1);
+  if (!solid(0, 1)) L.fillRect(x, y + 7, TS, 1);
+}
+function repaintCell(tx, ty) {
+  LVc.clearRect(tx * TS, ty * TS, TS, TS);
+  FGc.clearRect(tx * TS, ty * TS, TS, TS);
+  paintTile(tx, ty);
+}
+// Used after a tile changes (breakable wall destroyed, checkpoint restored): repaints it and its rock neighbours.
+function refreshTile(tx, ty) {
+  repaintCell(tx, ty);
+  for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+    const t = tileAt(tx + dx, ty + dy);
+    if (t === 1 || t === 4) repaintCell(tx + dx, ty + dy);
+  }
+}
+function paintCactus(x) {
+  const p = pen(LVc, x, GROUND_Y - 22), c = '#4f7d3a', hi = '#7fb35a';
+  p.r(3, 0, 3, 22, c); p.r(3, 0, 1, 22, hi);
+  p.r(0, 10, 4, 3, c); p.r(0, 6, 1, 4, c);
+  p.r(6, 7, 4, 3, c); p.r(9, 3, 1, 4, c);
+}
+function paintCar(x) {
+  const p = pen(FGc, x, GROUND_Y - 16);
+  p.r(0, 6, 32, 8, '#a94a33'); p.r(7, 1, 16, 6, '#c5623f');
+  p.r(9, 2, 12, 3, '#6f9fb0'); p.r(1, 6, 30, 1, '#e07b57');
+  p.r(2, 13, 6, 3, '#1b1520'); p.r(24, 13, 6, 3, '#1b1520');
+}
+
+// ---- parallax backgrounds, painted once per zone
+function buildBackgrounds() {
+  BG = ZONES.map((z, zi) => {
+    const sky = makeCanvas(W, H), sk = sky.getContext('2d');
+    const gr = sk.createLinearGradient(0, 0, 0, H);
+    gr.addColorStop(0, z.sky[0]); gr.addColorStop(1, z.sky[1]);
+    sk.fillStyle = gr; sk.fillRect(0, 0, W, H);
+    if (z.sun) {
+      sk.fillStyle = z.sun; sk.globalAlpha = 0.28;
+      sk.beginPath(); sk.arc(300, 40, 24, 0, Math.PI * 2); sk.fill();
+      sk.globalAlpha = 1;
+      sk.beginPath(); sk.arc(300, 40, 13, 0, Math.PI * 2); sk.fill();
+    }
+    if (zi === 1) {                                        // drifting smoke over the village
+      sk.fillStyle = '#1c1426';
+      for (let i = 0; i < 8; i++) { sk.globalAlpha = 0.18; sk.beginPath(); sk.arc(rr(0, W), rr(10, 70), rr(14, 26), 0, Math.PI * 2); sk.fill(); }
+      sk.globalAlpha = 1;
+    }
+    const far = makeCanvas(256, 130), mid = makeCanvas(256, 130), near = makeCanvas(256, 60);
+    paintRange(far.getContext('2d'), z.far, zi);
+    paintRuins(mid.getContext('2d'), z.mid, z.pal.lo, zi);
+    paintNear(near.getContext('2d'), z.near, zi);
+    return { sky, far, mid, near };
+  });
+}
+// Mountains and dunes: periodic in 256 px so the strip tiles seamlessly.
+function paintRange(x, col, seed) {
+  x.fillStyle = col;
+  x.beginPath(); x.moveTo(0, 130);
+  for (let px = 0; px <= 256; px += 4) {
+    const k = (px / 256) * Math.PI * 2;
+    const h = 52 + 22 * Math.sin(k * 2 + seed) + 12 * Math.sin(k * 5 + seed * 2.3) + 10 * hash((px / 4) % 64, seed * 17);
+    x.lineTo(px, 130 - h);
+  }
+  x.lineTo(256, 130); x.closePath(); x.fill();
+}
+// Mid-range ruins: blocks with rows of windows.
+function paintRuins(x, col, win, seed) {
+  let px = 0, i = 0;
+  while (px < 256) {
+    const bw = 14 + Math.floor(hash(i, seed) * 20);
+    const bh = 34 + Math.floor(hash(i + 40, seed) * 70);
+    x.fillStyle = col; x.fillRect(px, 130 - bh, bw, bh);
+    x.fillStyle = win;
+    for (let wy = 130 - bh + 8; wy < 124; wy += 10) for (let wx = px + 4; wx < px + bw - 4; wx += 7) x.fillRect(wx, wy, 2, 3);
+    px += bw + 3 + Math.floor(hash(i + 9, seed) * 8);
+    i++;
+  }
+}
+function paintNear(x, col, seed) {
+  x.fillStyle = col;
+  for (let i = 0; i < 5; i++) {
+    const px = Math.floor(hash(i, seed + 3) * 236), hgt = 14 + Math.floor(hash(i + 7, seed) * 26);
+    x.fillRect(px, 60 - hgt, 3, hgt);
+    x.fillRect(px + 3, 60 - hgt, 3, 2);
+  }
+}
+function drawStrip(img, factor, bottom) {
+  const off = Math.floor(camX * factor) % 256;
+  for (let x = -off; x < W; x += 256) g.drawImage(img, x, bottom - img.height);
+}
+
+// ---- level bookkeeping: locks, checkpoint, snapshots
+function startLock(L) {
+  G.done.add(L.id);
+  G.lock = { id: L.id, cam: L.cam, left: L.cam + 6, right: L.cam + W - 6, t: 0, boss: !!L.boss };
+  spawnWave(L);
+  if (L.boss) startBoss();
+}
+function waveCleared() {
+  return !enemies.some(e => e.wave === G.lock.id && !e.dead) && !trucks.some(t => t.lock === G.lock.id);
+}
+function endLock() {
+  G.lock = null;
+  G.msg = { text: 'GO!', t: 2.2 };
+}
+function updTriggers(dt) {
+  if (G.banner) { G.banner.t -= dt; if (G.banner.t <= 0) G.banner = null; }
+  if (G.msg) { G.msg.t -= dt; if (G.msg.t <= 0) G.msg = null; }
+  const z = zoneAt(P.x);
+  if (z !== G.zone) { G.zone = z; G.banner = { text: ZONES[z].name, t: 2.6 }; }
+  if (!G.done.has('ck') && P.x >= LEV.ckX) {
+    G.done.add('ck'); G.ck = snapshot();
+    G.msg = { text: 'CHECKPOINT', t: 1.8 };
+  }
+  for (const pl of LEV.placed) {
+    if (!G.done.has(pl.id) && P.x >= pl.trig) { G.done.add(pl.id); spawnEnemy(pl.k, pl.x, pl.y, 'ground', 0); }
+  }
+  if (!G.lock) {
+    for (const L of LEV.locks) if (!G.done.has(L.id) && P.x >= L.trig) { startLock(L); break; }
+  } else if (!G.lock.boss) {
+    G.lock.t += dt;
+    if (G.lock.t > 0.6 && waveCleared()) endLock();
+  }
+  if (G.lock) P.x = clamp(P.x, G.lock.left, G.lock.right);
+}
+function updCamera(dt) {
+  if (G.lock) camX = lerp(camX, G.lock.cam, Math.min(1, dt * 5));
+  else camX = lerp(camX, clamp(P.x - W * 0.42, 0, LW - W), Math.min(1, dt * 7));
+}
+function updAmbient(dt) {
+  for (const b of BIRDS) { b.x += b.v * dt; if (b.x > camX + W + 40) b.x = camX - 40 - rr(0, 60); }
+  for (const s of LEV.smoke) {
+    if (Math.abs(s.x - camX - W / 2) > W) continue;
+    s.t = (s.t || 0) - dt;
+    if (s.t <= 0) {
+      s.t = 0.25;
+      spawnPart(s.x + rr(-2, 2), s.y, rr(-5, 5), rr(-22, -12), rr(2.2, 3.2), '#6d6470', rr(3, 4), 0, 0.5, 'smoke');
+    }
+  }
+}
+function snapshot() {
+  return {
+    x: P.x, camX, score: G.score, rescued: G.rescued, weapon: G.weapon, ammo: { ...G.ammo }, grenades: G.grenades,
+    done: new Set(G.done), map: MAP.slice()
+  };
+}
+function clearDynamic() {
+  pbul = []; gren = []; booms = []; beams = []; texts = []; shakeAmt = 0;
+  ebul = []; hz = []; trucks = []; enemies = []; rockT = 2;
+  BOSS = null; bdebris = []; bbeams = [];
+}
+function restoreCheckpoint() {
+  const ck = G.ck;
+  for (let i = 0; i < MAP.length; i++) {
+    if (MAP[i] !== ck.map[i]) {
+      MAP[i] = ck.map[i];
+      refreshTile(i % TW, Math.floor(i / TW));
+    }
+  }
+  Object.assign(G, {
+    done: new Set(ck.done), score: ck.score, rescued: ck.rescued, weapon: ck.weapon, ammo: { ...ck.ammo },
+    grenades: ck.grenades, lock: null, msg: null, zone: -1
+  });
+  enemies = [];
+  clearDynamic();
+  spawnLevelObjects();
+  respawnPlayer();
+  P.x = ck.x; camX = ck.camX;
+}
+function newGame() {
+  Object.assign(G, {
+    score: 0, lives: 3, credits: 3, rescued: 0, zone: -1, lock: null, banner: null, msg: null, done: new Set(), ck: null,
+    weapon: 'pistol', ammo: { pistol: Infinity, mg: 0, spread: 0, flame: 0, rocket: 0, laser: 0 }, grenades: 5,
+    levelT: 0, paused: false
+  });
+  buildLevel();
+  enemies = [];
+  clearDynamic();
+  spawnLevelObjects();
+  respawnPlayer();
+  G.ck = snapshot();
+  go(Play);
+}
+
+// ---- world drawing
+function drawBirds() {
+  if (zoneAt(camX + W / 2) > 1) return;
+  g.fillStyle = INK_HEX;
+  for (const b of BIRDS) {
+    const sx = Math.round(scrX(b.x)), sy = Math.round(b.y + Math.sin(T * 2 + b.ph) * 2);
+    const f = Math.floor(T * 7 + b.ph) % 2;
+    g.fillRect(sx - 2, sy - f, 1, 1); g.fillRect(sx - 1, sy, 1, 1); g.fillRect(sx, sy, 1, 1);
+    g.fillRect(sx + 1, sy, 1, 1); g.fillRect(sx + 2, sy - f, 1, 1);
+  }
+}
+function drawFlags() {
+  for (const f of LEV.flags) {
+    const sx = scrX(f.x);
+    if (sx < -16 || sx > W + 16) continue;
+    g.fillStyle = INK_HEX; g.fillRect(sx, f.y, 1, GROUND_Y - f.y);
+    for (let i = 0; i < 9; i++) {
+      const wave = Math.round(Math.sin(T * 6 - i * 0.6) * (0.4 + i * 0.22));
+      g.fillStyle = f.col;
+      g.fillRect(sx + 1 + i, f.y + 1 + wave, 1, 5 - (i >> 2));
+    }
+  }
+}
+function drawFires() {
+  for (const f of LEV.fires) {
+    const sx = scrX(f.x);
+    if (sx < -10 || sx > W + 10) continue;
+    g.fillStyle = INK_HEX; g.fillRect(sx - 3, f.y - 6, 6, 6);
+    const k = 0.7 + 0.3 * Math.sin(T * 17 + f.x);
+    g.fillStyle = '#ff8a2b'; g.fillRect(sx - 2, f.y - 6 - Math.round(3 * k), 4, Math.round(3 * k) + 1);
+    g.fillStyle = '#ffe27a'; g.fillRect(sx - 1, f.y - 8 - Math.round(k), 2, 2);
+  }
+}
+function drawCheckpoint() {
+  const sx = scrX(LEV.ckX);
+  if (sx < -20 || sx > W + 20) return;
+  const on = G.done.has('ck');
+  g.fillStyle = INK_HEX; g.fillRect(sx, GROUND_Y - 26, 1, 26);
+  g.fillStyle = on ? '#6ff08a' : '#ff5a4a';
+  for (let i = 0; i < 6; i++) {
+    const wave = Math.round(Math.sin(T * 6 - i * 0.7) * (0.3 + i * 0.25));
+    g.fillRect(sx + 1 + i, GROUND_Y - 25 + wave, 1, 4);
+  }
+}
+function drawWorld() {
+  const z = BG[zoneAt(camX + W / 2)];
+  const cx = Math.round(camX);
+  g.drawImage(z.sky, 0, 0);
+  drawStrip(z.far, 0.18, 150);
+  drawStrip(z.mid, 0.42, 178);
+  drawBirds();
+  g.drawImage(LV, cx, 0, W, H, 0, 0, W, H);
+  drawFlags(); drawFires(); drawCheckpoint();
+  drawCrates(); drawItems(); drawCaptives(); drawHazards();
+  drawTank(); drawTrucks(); drawEnemies(); drawBoss(); drawBossDebris(); drawEBullets();
+  drawPlayer();
+  drawPBullets(); drawGrenades(); drawBeams();
+  drawParts(); drawBooms(); drawTexts();
+  g.drawImage(FG, cx, 0, W, H, 0, 0, W, H);
+  drawStrip(z.near, 1.25, H);
+}
+function drawOverlay() {
+  if (G.banner) {
+    const w = textW(G.banner.text) + 20;
+    panel((W - w) / 2, 12, w, 14, 0.7);
+    text(G.banner.text, W / 2, 16, '#ffd34d', 1, 'c');
+  }
+  if (G.msg) text(G.msg.text, W / 2, 84, '#ffffff', 2, 'c');
+  if (G.msg && G.msg.text === 'GO!') drawGoArrow();
+}
+
+const Play = {
+  update(dt) {
+    if (G.paused) {
+      if (pressed('pause') || pressed('start')) G.paused = false;
+      else if (pressed('weapon')) { G.paused = false; saveHi(); go(Title); }
+      return;
+    }
+    if (pressed('pause')) { G.paused = true; return; }
+    if (hitStop > 0) { hitStop -= dt; return; }
+    G.levelT += dt;
+    SND.music(BOSS && !BOSS.dying ? 'boss' : 'action');
+    updPlayer(dt);
+    updActions(dt);
+    updVehicle(dt);
+    updEnemies(dt);
+    updBoss(dt);
+    updBossFx(dt);
+    updEBullets(dt);
+    updHazards(dt);
+    updTrucks(dt);
+    updRockfall(dt);
+    updPBullets(dt);
+    updGrenades(dt);
+    updBooms(dt);
+    updBeams(dt);
+    updTexts(dt);
+    updItems(dt);
+    updCaptives(dt);
+    updTriggers(dt);
+    updAmbient(dt);
+    updParts(dt);
+    updCamera(dt);
+    updShake(dt);
+    updFx(dt);
+  },
+  draw() {
+    g.save();
+    if (shakeAmt) g.translate(Math.round(rr(-1, 1) * shakeAmt), Math.round(rr(-1, 1) * shakeAmt * 0.6));
+    drawWorld();
+    g.restore();
+    drawFlashes();
+    drawOverlay();
+    drawHUD();
+    if (G.paused) drawPause();
+  }
+};
+
+// ============================================================
+// 11. WEAPONS - six guns, grenades, knife, explosions, crates and pickups
+// ============================================================
+const WEAPONS = {
+  pistol: { name: 'PISTOL', cd: 0.2, ammo: Infinity, speed: 300, dmg: 1, col: '#ffe066', spread: 0.02 },
+  mg: { name: 'MACHINE GUN', cd: 0.07, ammo: 150, speed: 340, dmg: 1, col: '#ffb347', spread: 0.07 },
+  spread: { name: 'SPREAD', cd: 0.42, ammo: 40, speed: 290, dmg: 1, col: '#7dffb0', spread: 0.13 },
+  flame: { name: 'FLAMETHROWER', cd: 0.045, ammo: 140, speed: 175, dmg: 0.6, col: '#ff6a2b', spread: 0.12, life: 0.32, pierce: true },
+  rocket: { name: 'ROCKET LAUNCHER', cd: 0.75, ammo: 12, speed: 210, dmg: 4, col: '#ff4d6d', spread: 0, explode: true },
+  laser: { name: 'LASER', cd: 0.45, ammo: 30, speed: 0, dmg: 2, col: '#6ef3ff', spread: 0, beam: 240 }
+};
+const WPN_ORDER = ['pistol', 'mg', 'spread', 'flame', 'rocket', 'laser'];
+const WPN_DROP = WPN_ORDER.slice(1);
+let pbul = [], gren = [], booms = [], beams = [], texts = [], items = [], crates = [];
+let shakeAmt = 0;
+const shake = a => { shakeAmt = Math.max(shakeAmt, a); };
+
+function aimDir() {
+  const a = P.aimAng;
+  if (a === null) return { x: P.face, y: 0 };
+  return { x: P.face * Math.abs(Math.cos(a)), y: Math.sin(a) };
+}
+function muzzle(d) {
+  return { x: P.x + d.x * 7, y: P.y - (P.crouch ? 6 : 10) + d.y * 7 };
+}
+
+// Per-frame player actions: shooting, grenades, knife, weapon cycling.
+function updActions(dt) {
+  if (P.dead || P.inTank) return;
+  P.fireCD = Math.max(0, P.fireCD - dt);
+  P.flashT = Math.max(0, P.flashT - dt);
+  if (held.fire && P.fireCD <= 0) fireWeapon();
+  if (pressed('grenade')) throwGrenade();
+  if (pressed('knife') && P.knifeT <= 0) { P.knifeT = 0.25; P.hitDone = false; SND.knife(); }
+  if (pressed('weapon')) cycleWeapon();
+  updKnife();
+}
+function cycleWeapon() {
+  const owned = WPN_ORDER.filter(w => w === 'pistol' || G.ammo[w] > 0);
+  G.weapon = owned[(owned.indexOf(G.weapon) + 1) % owned.length];
+  G.msg = { text: WEAPONS[G.weapon].name, t: 1 };
+}
+function pickupWeapon(w) {
+  G.weapon = w;
+  G.ammo[w] = WEAPONS[w].ammo;
+  G.msg = { text: 'WEAPON GET!', t: 1.6 };
+}
+
+function fireWeapon() {
+  const id = G.weapon, w = WEAPONS[id];
+  if (G.ammo[id] <= 0) { G.weapon = 'pistol'; return; }
+  P.fireCD = w.cd;
+  P.flashT = 0.06;
+  P.shootT = 0;
+  const d = aimDir(), m = muzzle(d), base = Math.atan2(d.y, d.x);
+  if (id === 'laser') fireLaser(m, d);
+  else if (id === 'spread') for (let i = -2; i <= 2; i++) addPBullet(m, base + i * w.spread, w, id);
+  else addPBullet(m, base + rr(-w.spread, w.spread), w, id);
+  G.ammo[id] -= 1;
+  if (id === 'pistol' || id === 'mg') {
+    spawnPart(P.x - P.face * 2, P.y - 9, -P.face * rr(25, 45), rr(-130, -80), rr(0.9, 1.3), '#e8b642', 1.5, GRAV, 0.3, 'shell');
+  }
+  if (G.ammo[id] <= 0 && id !== 'pistol') { G.weapon = 'pistol'; G.msg = { text: 'OUT OF AMMO', t: 1.2 }; }
+  SND.shot(id);
+}
+function addPBullet(m, ang, w, id) {
+  const sp = w.speed * (id === 'flame' ? rr(0.85, 1.1) : 1);
+  pbul.push({
+    x: m.x, y: m.y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, dmg: w.dmg, kind: id,
+    life: w.life || 1.6, pierce: !!w.pierce, rocket: !!w.explode, col: w.col, dead: false
+  });
+}
+function fireLaser(m, d) {
+  const w = WEAPONS.laser;
+  let x = m.x, y = m.y, len = 0;
+  while (len < w.beam) {
+    x += d.x; y += d.y; len++;
+    const tx = Math.floor(x / TS), ty = Math.floor(y / TS), t = tileAt(tx, ty);
+    if (isSolid(t)) { if (t === 4) breakTile(tx, ty); break; }
+  }
+  beams.push({ x1: m.x, y1: m.y, x2: x, y2: y, t: 0.12, col: w.col });
+  sampleAlong(m.x, m.y, x, y, (px, py) => {
+    for (const c of crates) if (!c.dead && inRect(px, py, crateBox(c))) breakCrate(c);
+    return false;
+  });
+  laserHitEnemies(m.x, m.y, x, y, w.dmg);
+}
+// Walks along a segment every 2 px and calls fn(x, y); stops when fn returns true.
+function sampleAlong(x1, y1, x2, y2, fn) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1) / 2));
+  for (let i = 0; i <= n; i++) {
+    const f = i / n;
+    if (fn(x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)) return true;
+  }
+  return false;
+}
+
+// Moves every player projectile in small sub-steps so fast bullets cannot skip thin targets.
+function updPBullets(dt) {
+  for (const b of pbul) {
+    if (b.dead) continue;
+    b.life -= dt;
+    if (b.kind === 'flame') spawnPart(b.x, b.y, rr(-10, 10), rr(-22, -8), rr(0.25, 0.45), pick(['#ff9a2b', '#ffd34d', '#ff5a1f']), rr(2, 3.5), -40, 1.5, 'fire');
+    if (b.rocket) spawnPart(b.x, b.y, rr(-6, 6), rr(-6, 6), rr(0.4, 0.7), '#cfc6cf', rr(2, 3), 0, 1, 'smoke');
+    if (b.life <= 0) { if (b.rocket) boom(b.x, b.y, 26, 4, true); b.dead = true; continue; }
+    const n = Math.max(1, Math.ceil(Math.hypot(b.vx, b.vy) * dt / 2));
+    for (let i = 0; i < n && !b.dead; i++) {
+      b.x += b.vx * dt / n; b.y += b.vy * dt / n;
+      const tx = Math.floor(b.x / TS), ty = Math.floor(b.y / TS), t = tileAt(tx, ty);
+      if (isSolid(t)) {
+        if (t === 4) breakTile(tx, ty);
+        if (b.rocket) boom(b.x, b.y, 26, 4, true);
+        else if (b.kind !== 'flame') spawnPart(b.x, b.y, rr(-40, 40), rr(-60, 0), rr(0.2, 0.35), '#fff3a0', 1.5, 200, 2);
+        b.dead = true;
+        break;
+      }
+      if (hitCratesAt(b)) { if (!b.pierce) { b.dead = true; break; } }
+      if (hitEnemyAt(b)) { if (!b.pierce) { b.dead = true; break; } }
+    }
+  }
+  pbul = pbul.filter(b => !b.dead);
+}
+function crateBox(c) { return { l: c.x - 6, r: c.x + 6, t: c.y - 12, b: c.y }; }
+function hitCratesAt(b) {
+  for (const c of crates) {
+    if (!c.dead && inRect(b.x, b.y, crateBox(c))) { breakCrate(c); return true; }
+  }
+  return false;
+}
+
+// Knife: a short arc in front of the player; cuts crates, enemies and captive ropes.
+function updKnife() {
+  if (P.knifeT <= 0 || P.hitDone) return;
+  const r = P.face > 0 ? { l: P.x + 2, r: P.x + 15, t: P.y - 12, b: P.y - 2 } : { l: P.x - 15, r: P.x - 2, t: P.y - 12, b: P.y - 2 };
+  for (const c of crates) if (!c.dead && rectHit(crateBox(c), r)) breakCrate(c);
+  meleeEnemies(r);
+  P.hitDone = true;
+}
+
+// Grenades: thrown with an arc, bounce on the ground, explode after a short fuse.
+function throwGrenade() {
+  if (G.grenades <= 0 || P.throwT > 0 || P.dead) return;
+  G.grenades--;
+  P.throwT = 0.22;
+  const d = aimDir();
+  gren.push({
+    x: P.x + P.face * 3, y: P.y - 10, vx: d.x * 130 + P.vx * 0.4, vy: -170 + d.y * 110,
+    w: 4, h: 4, t: 1.5, bounces: 0, onGround: false, from: 'p', dead: false
+  });
+  SND.throw();
+}
+function updGrenades(dt) {
+  for (const gr of gren) {
+    if (gr.dead) continue;
+    gr.t -= dt;
+    gr.vy = Math.min(gr.vy + GRAV * dt, MAX_FALL);
+    const vyB = gr.vy;
+    if (moveX(gr, gr.vx * dt)) { gr.vx *= -0.4; gr.bounces++; }
+    moveY(gr, gr.vy * dt);
+    if (gr.onGround && vyB > 0) {
+      if (vyB > 40) { gr.vy = -vyB * 0.45; gr.vx *= 0.75; gr.bounces++; } else { gr.vy = 0; gr.vx *= 0.85; }
+    }
+    if (grenadeTouch(gr) || (gr.bomb && gr.onGround)) gr.t = 0;
+    if (gr.t <= 0 || gr.bounces > 4) {
+      gr.dead = true;
+      boom(gr.x, gr.y, gr.rad || 30, gr.dmg || 3, gr.from === 'p');
+    }
+  }
+  gren = gren.filter(gr => !gr.dead);
+}
+
+// Explosion: visuals, screen shake, destroys breakable walls and crates, and hurts whatever is in range.
+function boom(x, y, rad, dmg, friendly) {
+  booms.push({ x, y, r: rad, t: 0, dur: 0.5 });
+  shake(Math.min(7, 2 + rad / 7));
+  for (let i = 0; i < 12; i++) {
+    spawnPart(x, y, rr(-130, 130), rr(-170, 10), rr(0.35, 0.7), pick(['#fff3a0', '#ffd34d', '#ff9a2b', '#ff5a1f']), rr(2, 4), 220, 2.5);
+  }
+  for (let i = 0; i < 6; i++) {
+    spawnPart(x + rr(-rad / 2, rad / 2), y + rr(-rad / 3, 2), rr(-25, 25), rr(-60, -20), rr(0.8, 1.4), '#4b4150', rr(4, 7), -15, 0.8, 'smoke');
+  }
+  for (let ty = Math.floor((y - rad) / TS); ty <= Math.floor((y + rad) / TS); ty++) {
+    for (let tx = Math.floor((x - rad) / TS); tx <= Math.floor((x + rad) / TS); tx++) {
+      if (tileAt(tx, ty) === 4 && dist(tx * TS + 4, ty * TS + 4, x, y) < rad + 4) breakTile(tx, ty);
+    }
+  }
+  for (const c of crates) if (!c.dead && dist(c.x, c.y - 6, x, y) < rad + 6) breakCrate(c);
+  flashA = Math.max(flashA, rad >= 24 ? 0.35 : 0.1);
+  if (rad >= 30) hitStop = Math.max(hitStop, 0.05);
+  if (friendly) hurtEnemiesIn(x, y, rad, dmg);
+  else if (dist(P.x, P.y - 8, x, y) < rad + 6) hurtPlayer(dmg, P.x < x ? -1 : 1);
+  if (!friendly && TANK && !TANK.dead && dist(TANK.x, TANK.y - 9, x, y) < rad + 12) hurtTank(dmg);
+  SND.boom(rad);
+}
+function updBooms(dt) {
+  for (const b of booms) b.t += dt;
+  booms = booms.filter(b => b.t < b.dur);
+}
+function updBeams(dt) {
+  for (const b of beams) b.t -= dt;
+  beams = beams.filter(b => b.t > 0);
+}
+function updTexts(dt) {
+  for (const f of texts) { f.t -= dt; f.y -= 22 * dt; }
+  texts = texts.filter(f => f.t > 0);
+}
+function floatText(x, y, s, col = '#ffffff') { texts.push({ x, y, s, col, t: 0.9 }); }
+function addScore(n, x, y) { G.score += n; floatText(x, y, '+' + n, '#fff3a0'); }
+function updShake(dt) {
+  shakeAmt *= Math.exp(-dt * 10);
+  if (shakeAmt < 0.05) shakeAmt = 0;
+}
+
+// Breakable walls crumble into debris and leave a gap.
+function breakTile(tx, ty) {
+  const pal = ZONES[zoneAt(tx * TS)].pal;
+  MAP[ty * TW + tx] = 0;
+  refreshTile(tx, ty);
+  for (let i = 0; i < 8; i++) spawnPart(tx * TS + 4, ty * TS + 4, rr(-60, 60), rr(-120, -30), rr(0.4, 0.8), pal.hi, rr(1, 2), GRAV, 2);
+  SND.crack();
+}
+function breakCrate(c) {
+  c.dead = true;
+  if (c.id) G.done.add(c.id);
+  for (let i = 0; i < 8; i++) spawnPart(c.x + rr(-5, 5), c.y - 6, rr(-70, 70), rr(-150, -40), rr(0.4, 0.8), '#b67a45', rr(1.5, 2.5), GRAV, 1);
+  spawnItem('weapon', c.x, c.y - 6, rr(-30, 30), -150, c.wpn);
+  spawnItem(pick(['medal', 'fruit', 'gold']), c.x, c.y - 6, rr(-40, 40), -120);
+  SND.crate();
+}
+
+// Drops and level pickups.
+function spawnItem(k, x, y, vx, vy, wpn) {
+  items.push({ k, x, y, vx, vy, w: 8, h: 8, onGround: false, dead: false, life: 12, bob: rr(0, 6), wpn });
+}
+function spawnLevelObjects() {
+  crates = LEV.crates.filter(c => !G.done.has(c.id)).map(c => ({ id: c.id, x: c.x, y: c.y, wpn: pick(WPN_DROP), dead: false }));
+  items = LEV.items.filter(it => !G.done.has(it.id)).map(it => ({
+    id: it.id, k: it.k, x: it.x, y: it.y, vx: 0, vy: 0, w: 8, h: 8, onGround: false, dead: false, life: Infinity, bob: rr(0, 6)
+  }));
+  caps = LEV.captives.map(c => ({ ...c, st: G.done.has(c.id) ? 'free' : 'tied', t: 99 }));
+  TANK = G.done.has('tank') ? null : makeTank(LEV.tankX);
+}
+function updItems(dt) {
+  for (const it of items) {
+    if (it.dead) continue;
+    it.life -= dt;
+    if (it.life <= 0) { it.dead = true; continue; }
+    it.vy = Math.min(it.vy + GRAV * dt, MAX_FALL);
+    if (moveX(it, it.vx * dt)) it.vx = 0;
+    moveY(it, it.vy * dt);
+    if (it.onGround) { it.vy = 0; it.vx *= 0.8; }
+    if (!P.dead && rectHit(boxOf(it), boxOf(P))) collectItem(it);
+  }
+  items = items.filter(it => !it.dead);
+}
+function collectItem(it) {
+  it.dead = true;
+  if (it.id) G.done.add(it.id);
+  const x = it.x, y = it.y - 6;
+  switch (it.k) {
+    case 'medal': addScore(500, x, y); break;
+    case 'fruit': addScore(200, x, y); break;
+    case 'gold': addScore(1000, x, y); break;
+    case 'kit': P.hp = Math.min(3, P.hp + 1); floatText(x, y, 'HEALTH', '#6ff08a'); break;
+    case 'ammo':
+      if (G.weapon === 'pistol') G.grenades += 3; else G.ammo[G.weapon] += 20;
+      floatText(x, y, 'AMMO', '#ffe066'); break;
+    case 'shield': P.shield = 8; floatText(x, y, 'SHIELD', '#7fd4ff'); break;
+    case 'grenade': G.grenades += 3; floatText(x, y, '+3 GRN', '#9be36b'); break;
+    case 'weapon': pickupWeapon(it.wpn); break;
+  }
+  SND.pickup();
+}
+
+// ---- drawing: crates, pickups, projectiles, explosions
+const ITEM_COL = { medal: '#ffd34d', fruit: '#ff5a4a', gold: '#ffcf2e', kit: '#ffffff', ammo: '#ffe066', shield: '#7fd4ff', grenade: '#7fb35a', weapon: '#ffffff' };
+const ITEM_PAINT = {
+  medal: p => { p.dot(4, 4, 3.3, '#ffd34d'); p.dot(4, 4, 1.8, '#fff3a0'); p.r(2, 0, 1, 2, '#e53b2f'); p.r(5, 0, 1, 2, '#e53b2f'); },
+  fruit: p => { p.dot(3, 5, 2.5, '#e53b2f'); p.dot(7, 5, 2.5, '#e53b2f'); p.line(3, 3, 5, 0, 1, '#3f7a2a'); p.line(7, 3, 5, 0, 1, '#3f7a2a'); },
+  gold: p => { p.poly([[0, 6], [2, 2], [8, 2], [6, 6]], '#ffcf2e'); p.r(2, 3, 4, 1, '#fff3a0'); },
+  kit: p => { p.r(0, 0, 8, 8, '#f4f1ea'); p.r(3, 1, 2, 6, '#e53b2f'); p.r(1, 3, 6, 2, '#e53b2f'); },
+  ammo: p => { p.r(0, 2, 8, 6, '#6b4a2b'); p.r(1, 0, 2, 3, '#ffd34d'); p.r(4, 0, 2, 3, '#ffd34d'); p.r(6, 0, 1, 3, '#ffd34d'); },
+  shield: p => { p.dot(4, 4, 3.5, 'rgba(110,200,255,0.85)'); p.dot(4, 4, 2, 'rgba(210,245,255,0.9)'); },
+  grenade: p => { p.dot(4, 4, 3, '#3f5a2a'); p.r(3, 0, 2, 2, '#9aa3a8'); p.dot(3, 3, 1, '#7fb35a'); },
+  weapon: (p, wpn) => { p.r(0, 0, 8, 8, '#7a4a2a'); p.r(1, 1, 6, 6, '#e9e0d0'); p.r(2, 2, 4, 4, WEAPONS[wpn].col); }
+};
+function paintCrate(p, wpn) {
+  p.r(0, 0, 14, 14, '#7a4a2a'); p.r(1, 1, 12, 12, '#b67a45');
+  p.r(0, 5, 14, 1, '#6b4224'); p.r(0, 9, 14, 1, '#6b4224');
+  p.r(4, 2, 6, 3, WEAPONS[wpn].col);
+}
+function drawCrates() {
+  for (const c of crates) {
+    const sx = scrX(c.x);
+    if (sx < -16 || sx > W + 16) continue;
+    g.globalAlpha = 0.3 + 0.2 * Math.sin(T * 4 + c.x);
+    g.fillStyle = WEAPONS[c.wpn].col;
+    g.beginPath(); g.arc(Math.round(sx), c.y - 6, 9, 0, Math.PI * 2); g.fill();
+    g.globalAlpha = 1;
+    blit(sprite('crate' + c.wpn, 14, 14, p => paintCrate(p, c.wpn)), sx, c.y, 1);
+  }
+}
+function drawItems() {
+  for (const it of items) {
+    const sx = scrX(it.x);
+    if (sx < -10 || sx > W + 10) continue;
+    const bob = Math.round(Math.sin(T * 4 + it.bob) * 1.5);
+    g.globalAlpha = 0.25 + 0.15 * Math.sin(T * 5 + it.bob);
+    g.fillStyle = it.k === 'weapon' ? WEAPONS[it.wpn].col : ITEM_COL[it.k];
+    g.beginPath(); g.arc(Math.round(sx), it.y - 4 - bob, 7, 0, Math.PI * 2); g.fill();
+    g.globalAlpha = 1;
+    const key = it.k === 'weapon' ? 'wpn' + it.wpn : it.k;
+    const paint = it.k === 'weapon' ? p => ITEM_PAINT.weapon(p, it.wpn) : ITEM_PAINT[it.k];
+    blit(sprite('item-' + key, 8, 8, paint), sx, it.y - bob, 1);
+  }
+}
+function drawPBullets() {
+  for (const b of pbul) {
+    const sx = Math.round(scrX(b.x)), sy = Math.round(b.y);
+    if (b.kind === 'rocket') {
+      g.save(); g.translate(sx, sy); g.rotate(Math.atan2(b.vy, b.vx));
+      g.fillStyle = '#cfd6dc'; g.fillRect(-4, -1, 8, 3);
+      g.fillStyle = '#ff4d6d'; g.fillRect(-5, -1, 2, 3);
+      g.fillStyle = '#ffd34d'; g.fillRect(-7, 0, 2, 1);
+      g.restore();
+    } else if (b.kind === 'spread') {
+      g.fillStyle = b.col; g.fillRect(sx, sy, 2, 2);
+    } else if (b.kind !== 'flame') {
+      g.fillStyle = b.col; g.fillRect(sx - 2, sy, 3, 1);
+      g.fillStyle = '#fff6c2'; g.fillRect(sx, sy, 1, 1);
+    }
+  }
+}
+function drawGrenades() {
+  for (const gr of gren) {
+    const sx = Math.round(scrX(gr.x)), sy = Math.round(gr.y);
+    g.fillStyle = INK_HEX; g.fillRect(sx - 3, sy - 3, 6, 6);
+    g.fillStyle = gr.t < 0.4 && Math.floor(T * 16) % 2 ? '#ff5a4a' : '#4f7a34';
+    g.fillRect(sx - 2, sy - 2, 4, 4);
+    g.fillStyle = '#a9d88a'; g.fillRect(sx - 1, sy - 2, 1, 1);
+  }
+}
+function drawBeams() {
+  for (const b of beams) {
+    const a = b.t / 0.12;
+    const sx1 = Math.round(scrX(b.x1)), sx2 = Math.round(scrX(b.x2));
+    g.globalAlpha = 0.45 * a; g.strokeStyle = b.col; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(sx1, Math.round(b.y1)); g.lineTo(sx2, Math.round(b.y2)); g.stroke();
+    g.globalAlpha = a; g.strokeStyle = '#ffffff'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(sx1, Math.round(b.y1)); g.lineTo(sx2, Math.round(b.y2)); g.stroke();
+    g.globalAlpha = 1;
+  }
+}
+function drawBooms() {
+  for (const b of booms) {
+    const k = b.t / b.dur;
+    const r = b.r * (0.35 + 0.65 * Math.min(1, k * 2.5)) * (1 - k * 0.25);
+    const sx = scrX(b.x), sy = b.y;
+    g.fillStyle = k < 0.2 ? '#fff6c2' : k < 0.45 ? '#ffd34d' : k < 0.75 ? '#ff7a2b' : '#4b4150';
+    g.beginPath();
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * Math.PI * 2, rad = r * (i % 2 ? 0.66 : 1.05);
+      const px = sx + Math.cos(a) * rad, py = sy + Math.sin(a) * rad;
+      if (i) g.lineTo(px, py); else g.moveTo(px, py);
+    }
+    g.closePath(); g.fill();
+  }
+}
+function drawTexts() {
+  for (const f of texts) text(f.s, Math.round(scrX(f.x)), Math.round(f.y), f.col, 1, 'c');
+}
+
+// ============================================================
+// 12. ENEMIES - nine kinds with their own AI, entrances, hit reactions and funny deaths
+// ============================================================
+const EDEF = {
+  grunt: { w: 9, h: 15, hp: 2, score: 100 },
+  rusher: { w: 9, h: 14, hp: 2, score: 150 },
+  sniper: { w: 9, h: 15, hp: 1, score: 250 },
+  heavy: { w: 15, h: 22, hp: 9, score: 500 },
+  drone: { w: 17, h: 9, hp: 3, score: 300 },
+  turret: { w: 12, h: 12, hp: 4, score: 200 },
+  barrel: { w: 9, h: 14, hp: 2, score: 200 },
+  runner: { w: 9, h: 13, hp: 1, score: 120 },
+  jeep: { w: 30, h: 14, hp: 12, score: 600 }
+};
+let enemies = [];
+let ebul = [];               // enemy bullets
+let hz = [];                 // hazards: thrown and explosive barrels, falling rocks
+let trucks = [];             // troop trucks that unload soldiers
+let rockT = 2;
+
+function spawnEnemy(k, x, y, ek = 'ground', wave = 0) {
+  const d = EDEF[k];
+  const e = {
+    k, x, y, w: d.w, h: d.h, vx: 0, vy: 0, hp: d.hp, score: d.score, face: P.x < x ? -1 : 1,
+    onGround: false, st: 'idle', tm: 0, tm2: 0, cd: rr(0.5, 1.5), gc: rr(1, 3), atk: 0,
+    hurt: 0, dead: false, dT: 0, ang: 0, spin: 0, t: rr(0, 6), seed: rr(0, 6),
+    aimA: 0, aimX: x, aimY: y, burst: 0, carry: true, wheel: 0, dir: 0, ek, ent: 0, wave, gone: false
+  };
+  if (k === 'jeep') e.dir = e.face;
+  if (ek === 'drop') { e.ent = 4; e.vy = 0; }
+  else if (ek === 'window' || ek === 'burst' || ek === 'truck') { e.ent = 1.5; e.vy = -150; e.vx = e.face * rr(40, 70); }
+  freeSpawn(e);
+  enemies.push(e);
+  return e;
+}
+// Nudges a freshly spawned enemy out of any wall or floor it overlaps, so it never starts inside geometry.
+function freeSpawn(e) {
+  const x0 = e.x, y0 = e.y;
+  for (let dy = 0; dy >= -40; dy--) {
+    for (let dx = 0; dx <= 16; dx++) {
+      for (const s of dx ? [1, -1] : [1]) {
+        e.x = x0 + dx * s; e.y = y0 + dy;
+        if (!solidOverlap(boxOf(e))) return;
+      }
+    }
+  }
+  e.x = x0; e.y = y0;
+}
+const toP = e => P.x - e.x;
+const dyP = e => (P.y - 8) - (e.y - e.h / 2);
+function shootEnemy(x, y, tx, ty, speed, dmg, kind, spread = 0.05) {
+  const a = Math.atan2(ty - y, tx - x) + rr(-spread, spread);
+  ebul.push({ x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, dmg, kind, life: 2.2, dead: false });
+}
+function throwEnemyGrenade(e) {
+  gren.push({
+    x: e.x + e.face * 3, y: e.y - 12, vx: e.face * 90, vy: -185, w: 4, h: 4, t: 1.6, bounces: 0,
+    onGround: false, from: 'e', dead: false, rad: 26, dmg: 1
+  });
+}
+// Walks along the ground; a low obstacle is hopped over half the time, otherwise the enemy turns around.
+function walk(e, dt) {
+  e.vy = Math.min(e.vy + GRAV * dt, MAX_FALL);
+  if (moveX(e, e.vx * dt)) {
+    if (e.onGround && (e.wave || Math.random() < 0.5)) e.vy = -235;      // clears a 4-tile wall
+    else if (e.onGround) { e.vx = -e.vx; e.face = -e.face; }
+  }
+  moveY(e, e.vy * dt);
+  if (e.y > TH * TS + 40) e.gone = true;
+}
+
+function updEnemies(dt) {
+  for (const e of enemies) {
+    if (e.gone) continue;
+    e.t += dt;
+    e.hurt = Math.max(0, e.hurt - dt);
+    e.cd = Math.max(0, e.cd - dt);
+    e.gc = Math.max(0, e.gc - dt);
+    e.atk = Math.max(0, e.atk - dt);
+    if (e.dead) { updDeadEnemy(e, dt); continue; }
+    if (e.ent > 0) { updEntry(e, dt); continue; }
+    AI[e.k](e, dt);
+  }
+  enemies = enemies.filter(e => !e.gone);
+}
+const AI = {
+  grunt: (e, dt) => {
+    const dx = toP(e), adx = Math.abs(dx);
+    if (e.st === 'panic') {                              // flailing retreat
+      e.face = dx > 0 ? -1 : 1;
+      e.vx = e.face * 80;
+      e.tm -= dt;
+      if (e.tm <= 0) e.st = 'idle';
+      walk(e, dt);
+      return;
+    }
+    if (e.st === 'cover') {                              // crouching behind cover
+      e.face = dx >= 0 ? 1 : -1;
+      e.vx = 0; e.tm -= dt;
+      if (e.tm <= 0) e.st = 'idle';
+      walk(e, dt);
+      return;
+    }
+    e.face = dx >= 0 ? 1 : -1;
+    e.vx = adx > 60 ? e.face * 24 : 0;
+    walk(e, dt);
+    if (P.dead) return;
+    if (e.cd <= 0 && adx < 160 && Math.abs(dyP(e)) < 40) {
+      shootEnemy(e.x + e.face * 5, e.y - 9, P.x, P.y - 8, 115, 1, 'bullet', 0.07);
+      e.cd = rr(1.1, 1.8);
+      if (Math.random() < 0.45) { e.st = 'cover'; e.tm = rr(0.6, 1.0); }
+    }
+    if (e.gc <= 0 && adx < 130 && Math.random() < 0.012) { throwEnemyGrenade(e); e.gc = 4.5; }
+  },
+  rusher: (e, dt) => {
+    const dx = toP(e), adx = Math.abs(dx);
+    e.face = dx >= 0 ? 1 : -1;
+    if ((adx < 170 || e.wave) && !P.dead) {               // wave fighters always come at the player
+      e.vx = e.face * 96;
+      if (adx < 24 && e.cd <= 0) { e.cd = 0.8; e.atk = 0.26; }
+      if (e.atk > 0 && rectHit(knifeRect(e), boxOf(P))) hurtPlayer(1, e.face);
+    } else e.vx = 0;
+    if (e.onGround && adx > 40 && adx < 70 && e.cd <= 0 && Math.random() < 0.03) { e.vy = -190; e.cd = 1.2; }
+    walk(e, dt);
+  },
+  sniper: (e, dt) => {
+    e.face = P.x >= e.x ? 1 : -1;
+    e.vx = 0;
+    walk(e, dt);
+    if (P.dead) { e.st = 'idle'; return; }
+    if (e.st === 'idle') {
+      if (Math.abs(P.x - e.x) < 240 && e.cd <= 0) { e.st = 'aim'; e.tm = 1.1; }
+    } else {
+      e.aimX = P.x; e.aimY = P.y - 8;                    // the laser follows the player while charging
+      e.tm -= dt;
+      if (e.tm <= 0) {
+        shootEnemy(e.x + e.face * 4, e.y - 10, e.aimX, e.aimY, 330, 1, 'sniper', 0.01);
+        e.st = 'idle'; e.cd = 2.2;
+      }
+    }
+  },
+  heavy: (e, dt) => {
+    const dx = toP(e), adx = Math.abs(dx);
+    e.face = dx >= 0 ? 1 : -1;
+    e.vx = adx > 110 ? e.face * 18 : 0;
+    walk(e, dt);
+    if (e.tm2 > 0) e.tm2 -= dt;
+    if (e.burst > 0 && e.tm2 <= 0 && !P.dead) {
+      shootEnemy(e.x + e.face * 8, e.y - 12, P.x, P.y - 8, 150, 1, 'shell', 0.05);
+      e.burst--; e.tm2 = 0.22;
+    } else if (e.burst <= 0 && e.cd <= 0 && adx < 170 && !P.dead) {
+      e.burst = 3; e.cd = 1.8;
+    }
+  },
+  drone: (e, dt) => {
+    const tx = P.x + Math.sin(T * 0.6 + e.seed) * 80;
+    e.vx = clamp((tx - e.x) * 1.2, -70, 70);
+    e.x += e.vx * dt;
+    e.y = 96 + Math.sin(T * 2.2 + e.seed) * 6;       // low enough to be shot at with an upward aim
+    if (P.dead) return;
+    if (e.cd <= 0 && Math.abs(P.x - e.x) < 90) {
+      gren.push({ x: e.x, y: e.y + 2, vx: 0, vy: 30, w: 4, h: 4, t: 3, bounces: 0, onGround: false, from: 'e', dead: false, rad: 22, dmg: 1, bomb: true });
+      e.cd = 1.7;
+    }
+  },
+  turret: (e, dt) => {
+    e.face = P.x >= e.x ? 1 : -1;
+    const want = Math.atan2(P.y - 8 - (e.y - 8), P.x - e.x);
+    e.aimA = lerp(e.aimA, want, Math.min(1, dt * 4));
+    if (P.dead || Math.abs(P.x - e.x) > 220) return;
+    if (e.cd <= 0) {
+      shootEnemy(e.x + Math.cos(e.aimA) * 7, e.y - 8 + Math.sin(e.aimA) * 7, P.x, P.y - 8, 150, 1, 'mg', 0.04);
+      e.cd = 1.2;
+    }
+  },
+  barrel: (e, dt) => {
+    const dx = toP(e), adx = Math.abs(dx);
+    e.face = dx >= 0 ? 1 : -1;
+    e.vx = adx > 60 ? e.face * 22 : 0;
+    walk(e, dt);
+    if (e.carry && !P.dead && adx < 130 && e.cd <= 0) {
+      hz.push({ k: 'barrel', x: e.x + e.face * 6, y: e.y - 16, vx: e.face * 95, vy: -150, w: 7, h: 9, fuse: 4, bounces: 0, onGround: false, dead: false });
+      e.carry = false; e.cd = 5;
+    }
+    if (!e.carry && e.cd <= 0) e.carry = true;
+  },
+  runner: (e, dt) => {
+    const dx = toP(e), adx = Math.abs(dx);
+    e.face = dx >= 0 ? 1 : -1;
+    e.vx = adx < 190 || e.wave ? e.face * 112 : e.face * 24;
+    walk(e, dt);
+    if (!P.dead && adx < 12 && Math.abs(dyP(e)) < 16) {   // runs into the player and blows up
+      boom(e.x, e.y - 6, 24, 1, false);
+      e.gone = true;
+    }
+  },
+  jeep: (e, dt) => {
+    e.vx = e.dir * 120;
+    e.x += e.vx * dt;
+    e.y = GROUND_Y; e.onGround = true;
+    e.wheel += e.vx * dt * 0.3;
+    if (!P.dead && e.cd <= 0 && Math.abs(P.x - e.x) < 200) {
+      shootEnemy(e.x + e.dir * 16, e.y - 12, P.x, P.y - 8, 170, 1, 'mg', 0.05);
+      e.cd = 0.55;
+    }
+    if (!P.dead && rectHit(boxOf(e), boxOf(P))) hurtPlayer(1, e.dir);
+    if (e.x < camX - 90 || e.x > camX + W + 90) e.gone = true;
+  }
+};
+function knifeRect(e) {
+  return e.face > 0 ? { l: e.x + 1, r: e.x + 14, t: e.y - 11, b: e.y - 2 } : { l: e.x - 14, r: e.x - 1, t: e.y - 11, b: e.y - 2 };
+}
+// Entrance: parachute drop, a jump out of a window, a burst out of a broken wall or a truck.
+function updEntry(e, dt) {
+  e.ent -= dt;
+  if (e.ek === 'drop') e.vy = Math.min(e.vy + 120 * dt, 46);
+  else {
+    e.vy = Math.min(e.vy + GRAV * dt, MAX_FALL);
+    if (moveX(e, e.vx * dt)) e.vx = 0;
+  }
+  moveY(e, e.vy * dt);
+  if (e.onGround || e.ent <= 0) { e.ent = 0; e.vx = 0; }
+}
+
+// Hit reactions and deaths
+function hitEnemyAt(b) {
+  if (hitBossAt(b)) return true;
+  for (const e of enemies) {
+    if (!e.dead && e.ent <= 0 && inRect(b.x, b.y, boxOf(e))) {
+      hurtEnemy(e, b.dmg, b);
+      return true;
+    }
+  }
+  for (const h of hz) {
+    if (!h.dead && (h.k === 'barrel' || h.k === 'hbarrel') && inRect(b.x, b.y, boxOf(h))) { h.fuse = 0; return true; }
+  }
+  for (const c of caps) {
+    if (c.st === 'tied' && inRect(b.x, b.y, capRope(c))) { freeCaptive(c); return true; }
+  }
+  return false;
+}
+function hurtEnemy(e, dmg, b) {
+  if (e.dead || e.ent > 0) return;
+  if (e.k === 'heavy' && b && sgn(b.vx) === -e.face) dmg *= 0.35;     // armour blocks shots from the front
+  e.hp -= dmg;
+  e.hurt = 0.12;
+  if (b && e.k !== 'heavy' && e.k !== 'turret' && e.k !== 'jeep') e.vx += sgn(b.vx) * 22;
+  spawnPart(e.x + rr(-3, 3), e.y - e.h * 0.6, rr(-50, 50), rr(-70, -20), rr(0.2, 0.35), '#fff3a0', 1.5, 200, 2);
+  if (e.k === 'heavy' && dmg < 1) floatText(e.x, e.y - e.h - 6, 'CLANG!', '#cfd6e0');
+  SND.hit();
+  if (e.hp <= 0) { killEnemy(e); return; }
+  if (e.k === 'grunt' && e.hp <= 1 && e.st !== 'panic' && Math.random() < 0.45) {
+    e.st = 'panic'; e.tm = 1.6;
+    floatText(e.x, e.y - e.h - 6, 'HELP!', '#ffffff');
+  }
+}
+function killEnemy(e) {
+  if (e.dead) return;
+  e.dead = true; e.dT = 0; e.hp = 0; e.ang = 0;
+  e.spin = rr(8, 12) * (Math.random() < 0.5 ? -1 : 1);
+  e.vy = -170; e.vx = -e.face * 55;
+  addScore(e.score, e.x, e.y - e.h - 6);
+  SND.voice(e.k);
+  const ex = e.x, ey = e.y - e.h / 2;
+  switch (e.k) {
+    case 'grunt':
+      floatText(ex, ey - 14, pick(['AAAH!', 'OOF!', 'NOOO!', 'WHEE!']), '#ffffff');
+      for (let i = 0; i < 6; i++) spawnPart(ex, ey, rr(-60, 60), rr(-80, -20), rr(0.5, 0.8), '#fff3a0', 1.5, 200, 1.5);
+      break;
+    case 'rusher': e.vy = -230; e.spin = e.face * 16; floatText(ex, ey - 14, 'HIYAA!', '#ffffff'); break;
+    case 'sniper': e.vx = -e.face * 40; e.vy = 0; e.spin = e.face * 6; floatText(ex, ey - 14, 'MY RIFLE!', '#ffe066'); break;
+    case 'heavy':
+      boom(ex, ey, 26, 3, true);
+      for (let i = 0; i < 8; i++) spawnPart(ex, ey, rr(-90, 90), rr(-150, -40), rr(0.6, 1.1), '#5b6070', rr(3, 5), GRAV, 1);
+      e.gone = true;
+      break;
+    case 'drone': e.vx = 0; e.vy = 0; e.spin = 9; break;
+    case 'turret': e.vx = 0; for (let i = 0; i < 8; i++) spawnPart(ex, e.y - 8, rr(-70, 70), rr(-100, -20), rr(0.4, 0.8), '#ffd34d', 1.5, 300, 1); break;
+    case 'barrel':
+      hz.push({ k: 'barrel', x: ex, y: e.y - 12, vx: 0, vy: -90, w: 7, h: 9, fuse: 0.9, bounces: 0, onGround: false, dead: false });
+      break;
+    case 'runner': boom(ex, ey, 18, 1, true); e.gone = true; break;
+    case 'jeep': e.vx *= 0.3; e.vy = -200; e.spin = 6; break;
+  }
+  if (Math.random() < 0.18) spawnItem(pick(['medal', 'fruit', 'gold']), ex, e.y - 2, rr(-30, 30), -110);
+}
+function updDeadEnemy(e, dt) {
+  e.dT += dt;
+  if (e.k === 'turret') {
+    if (Math.random() < dt * 6) spawnPart(e.x, e.y - 10, rr(-6, 6), rr(-30, -10), rr(0.8, 1.2), '#8d8794', rr(3, 5), -10, 0.5, 'smoke');
+    if (e.dT > 4) e.gone = true;
+    return;
+  }
+  if (e.k === 'jeep') {
+    e.vy = Math.min(e.vy + GRAV * dt, MAX_FALL); e.y += e.vy * dt;
+    if (e.y > GROUND_Y) { e.y = GROUND_Y; e.vy = 0; }
+    e.ang += e.spin * dt;
+    if (e.dT > 0.7) { boom(e.x, e.y - 8, 30, 3, true); e.gone = true; }
+    return;
+  }
+  if (e.k === 'drone') {                                // spiralling down, then crashes
+    e.ang += e.spin * dt;
+    e.vy = Math.min(e.vy + 200 * dt, MAX_FALL);
+    e.y += e.vy * dt;
+    if (Math.random() < dt * 12) spawnPart(e.x, e.y - 4, rr(-8, 8), rr(-20, -6), rr(0.6, 1), '#6d6470', rr(3, 4), -20, 0.5, 'smoke');
+    if (e.y >= GROUND_Y - 4) { boom(e.x, GROUND_Y - 6, 22, 2, true); e.gone = true; }
+    return;
+  }
+  e.vy = Math.min(e.vy + GRAV * dt, MAX_FALL);          // ragdoll for soldiers
+  moveX(e, e.vx * dt);
+  moveY(e, e.vy * dt);
+  if (e.onGround) { e.vx *= 0.85; e.spin *= 0.85; }
+  e.ang += e.spin * dt;
+  if (e.dT > 1.6) e.gone = true;
+}
+
+// Enemy bullets, grenades and hazards
+function updEBullets(dt) {
+  for (const b of ebul) {
+    b.life -= dt;
+    if (b.home) {                                       // missiles steer toward the player
+      b.vx += (P.x - b.x) * 1.4 * dt; b.vy += (P.y - 8 - b.y) * 1.4 * dt;
+      const sp = Math.hypot(b.vx, b.vy);
+      if (sp > 150) { b.vx *= 150 / sp; b.vy *= 150 / sp; }
+    }
+    const n = Math.max(1, Math.ceil(Math.hypot(b.vx, b.vy) * dt / 2));
+    for (let i = 0; i < n && !b.dead; i++) {
+      b.x += b.vx * dt / n; b.y += b.vy * dt / n;
+      if (isSolid(tileAt(Math.floor(b.x / TS), Math.floor(b.y / TS)))) {
+        spawnPart(b.x, b.y, rr(-30, 30), rr(-40, 0), rr(0.2, 0.3), '#fff3a0', 1.5, 200, 2);
+        b.dead = true; break;
+      }
+      if (TANK && !TANK.dead && inRect(b.x, b.y, boxOf(TANK))) { hurtTank(b.dmg); b.dead = true; break; }
+      if (!P.dead && !P.inTank && inRect(b.x, b.y, boxOf(P))) { hurtPlayer(b.dmg, sgn(b.vx)); b.dead = true; break; }
+    }
+    if (b.life <= 0) b.dead = true;
+  }
+  ebul = ebul.filter(b => !b.dead);
+}
+function grenadeTouch(gr) {
+  if (gr.from === 'p') {
+    for (const e of enemies) if (!e.dead && e.ent <= 0 && inRect(gr.x, gr.y, boxOf(e))) return true;
+    return false;
+  }
+  return !P.dead && inRect(gr.x, gr.y, boxOf(P));
+}
+function hurtEnemiesIn(x, y, rad, dmg) {
+  hurtBossIn(x, y, rad, dmg);
+  for (const e of enemies) {
+    if (!e.dead && e.ent <= 0 && dist(e.x, e.y - e.h / 2, x, y) < rad + e.w / 2) hurtEnemy(e, dmg, { vx: e.x - x });
+  }
+  for (const h of hz) {
+    if (!h.dead && (h.k === 'barrel' || h.k === 'hbarrel') && dist(h.x, h.y, x, y) < rad + 4) h.fuse = Math.min(h.fuse, 0.15);
+  }
+}
+function meleeEnemies(r) {
+  meleeBoss(r);
+  for (const c of caps) if (c.st === 'tied' && rectHit(capRope(c), r)) freeCaptive(c);
+  for (const e of enemies) {
+    if (e.dead || e.ent > 0 || !rectHit(boxOf(e), r)) continue;
+    if (e.k === 'heavy' || e.k === 'turret' || e.k === 'jeep') hurtEnemy(e, 2, null);
+    else killEnemy(e);
+  }
+}
+function laserHitEnemies(x1, y1, x2, y2, dmg) {
+  laserHitBoss(x1, y1, x2, y2, dmg);
+  for (const e of enemies) {
+    if (e.dead || e.ent > 0) continue;
+    const box = boxOf(e);
+    sampleAlong(x1, y1, x2, y2, (px, py) => {
+      if (!inRect(px, py, box)) return false;
+      hurtEnemy(e, dmg, null);
+      return true;
+    });
+  }
+}
+function updHazards(dt) {
+  for (const h of hz) {
+    if (h.dead) continue;
+    if (h.k === 'rock') {
+      h.vy = Math.min(h.vy + GRAV * dt, MAX_FALL);
+      moveY(h, h.vy * dt);
+      if (h.onGround) { for (let i = 0; i < 4; i++) spawnPart(h.x, h.y, rr(-30, 30), rr(-30, -5), rr(0.3, 0.5), ZONES[2].pal.base, 1.5, GRAV, 1); h.dead = true; continue; }
+      if (!P.dead && inRect(h.x, h.y, boxOf(P))) { hurtPlayer(1, sgn(h.x - P.x)); h.dead = true; }
+      continue;
+    }
+    if (h.k === 'barrel') {
+      h.vy = Math.min(h.vy + GRAV * dt, MAX_FALL);
+      const vyB = h.vy;
+      if (moveX(h, h.vx * dt)) h.vx *= -0.5;
+      moveY(h, h.vy * dt);
+      if (h.onGround && vyB > 40) { h.vy = -vyB * 0.3; h.vx *= 0.7; } else if (h.onGround) { h.vy = 0; h.vx *= 0.85; }
+      h.fuse -= dt;
+    }
+    if (!P.dead && inRect(h.x, h.y - 4, boxOf(P))) h.fuse = 0;   // touching a barrel sets it off
+    if (h.fuse <= 0) {
+      h.dead = true;
+      boom(h.x, h.y - 5, 24, 2, false);
+      hurtEnemiesIn(h.x, h.y - 5, 24, 2);
+    }
+  }
+  hz = hz.filter(h => !h.dead);
+}
+function updRockfall(dt) {
+  if (zoneAt(P.x) !== 2 || P.dead) return;
+  rockT -= dt;
+  if (rockT <= 0) {
+    rockT = rr(1.6, 2.6);
+    hz.push({ k: 'rock', x: clamp(P.x + rr(-60, 140), 4230, 5780), y: 82, vy: 0, w: 6, h: 6, onGround: false, dead: false });
+  }
+}
+function breakNear(x, y) {
+  for (let ty = Math.floor((y - 14) / TS); ty <= Math.floor((y + 4) / TS); ty++) {
+    for (let tx = Math.floor((x - 12) / TS); tx <= Math.floor((x + 12) / TS); tx++) {
+      if (tileAt(tx, ty) === 4) breakTile(tx, ty);
+    }
+  }
+}
+function updTrucks(dt) {
+  for (const tr of trucks) {
+    tr.tm += dt;
+    if (tr.st === 'drive') {
+      tr.x += tr.vx * dt;
+      if (tr.x <= tr.stopX) { tr.x = tr.stopX; tr.st = 'unload'; tr.tm = 0; }
+    } else if (tr.st === 'unload') {
+      if (tr.tm > 0.5 && tr.n > 0) {
+        tr.n--; tr.tm = 0.4;
+        spawnEnemy('grunt', tr.x - 8, GROUND_Y - 14, 'truck', tr.lock);
+      }
+      if (tr.n <= 0 && tr.tm > 0.8) tr.st = 'leave';
+    } else if (tr.st === 'leave') {
+      tr.x += 150 * dt;
+      if (tr.x > camX + W + 80) tr.gone = true;
+    }
+  }
+  trucks = trucks.filter(tr => !tr.gone);
+}
+function spawnWave(L) {
+  for (const [k, x, ek = 'ground', y] of LEV.waves[L.id] || []) {
+    if (k === 'truck') { trucks.push({ x: x + 200, stopX: x, vx: -140, st: 'drive', tm: 0, n: 3, lock: L.id }); continue; }
+    if (k === 'hbarrel') { hz.push({ k, x, y: GROUND_Y, vx: 0, vy: 0, w: 8, h: 8, fuse: Infinity, onGround: false, dead: false }); continue; }
+    if (ek === 'burst') breakNear(x, y);
+    const yy = ek === 'drop' ? 20 : (y !== undefined ? y : GROUND_Y);
+    spawnEnemy(k, x, yy, ek, L.id);
+  }
+}
+
+// ---- enemy art: soldiers share the commando rig with their own palettes; the rest are small painters
+const SOLDIER_PAL = {
+  grunt: { shirt: '#b89a5e', shirtD: '#8a7144', pants: '#5f5238', pantsD: '#463c2a', skin: '#f0b48c', hat: '#4d5d3a', hatD: '#34402a', belt: '#3d3324' },
+  rusher: { shirt: '#23232b', shirtD: '#14141a', pants: '#2a2a33', pantsD: '#1a1a20', skin: '#e8a980', band: '#f2f2f2', belt: '#444a55' },
+  sniper: { shirt: '#4e6b35', shirtD: '#34491f', pants: '#3a4f29', pantsD: '#2b3b20', skin: '#e9b08a', hat: '#5b6b41', hatD: '#3f4b2c', belt: '#2d2a1f' },
+  runner: { shirt: '#f2f2f2', shirtD: '#cfcfcf', pants: '#3d3b52', pantsD: '#2c2a3c', skin: '#dda079', band: '#2f2f2f', belt: '#5a4a3a' },
+  barrel: { shirt: '#3e6fa8', shirtD: '#2b4f7d', pants: '#333b4d', pantsD: '#262c3a', skin: '#e8b08a', hat: '#3a3f52', hatD: '#2a2e3d', belt: '#2b2f3d' }
+};
+function paintSoldier(p, s, c) {
+  const oy = (s.cr ? 3 : 0) - (s.bob || 0);
+  paintArm(p, 7, 11 + oy, s.ab, c.shirtD, null, c.skin);
+  paintLeg(p, 8, 16 + oy, s.lb[0], s.lb[1], c.pantsD);
+  p.r(6, 10 + oy, 8, 6, c.shirt);
+  p.r(6, 14 + oy, 8, 2, c.belt);
+  if (s.extra === 'barrel') { p.r(0, 7 + oy, 6, 8, '#c8432f'); p.r(0, 9 + oy, 6, 1, '#222'); p.r(0, 12 + oy, 6, 1, '#222'); }
+  if (s.extra === 'dyn') { p.r(7, 11 + oy, 2, 4, '#d72d2d'); p.r(10, 11 + oy, 2, 4, '#d72d2d'); p.r(8, 10 + oy, 1, 1, '#ffd23f'); }
+  paintLeg(p, 12, 16 + oy, s.lf[0], s.lf[1], c.pants);
+  paintArm(p, 13, 11 + oy, s.af, c.shirt, s.hold, c.skin);
+  const hx = 10 + (s.hd || 0), hy = 6 + oy;
+  p.dot(hx, hy, 3.3, c.skin);
+  if (c.hat) p.poly([[hx - 3.8, hy - 0.4], [hx - 3.4, hy - 3.8], [hx + 3.4, hy - 3.8], [hx + 3.8, hy - 0.4]], c.hat);
+  if (c.band) p.r(hx - 3.6, hy - 2.2, 7.2, 1.4, c.band);
+  if (s.face === 'x') {
+    p.line(hx - 0.2, hy - 0.6, hx + 1.4, hy + 1.0, 0.9, CMD.shade);
+    p.line(hx + 1.4, hy - 0.6, hx - 0.2, hy + 1.0, 0.9, CMD.shade);
+    p.dot(hx + 0.6, hy + 2.2, 0.9, CMD.shade);
+  } else if (s.face === 'p') {                          // panic: wide eyes, open mouth
+    p.dot(hx + 1.2, hy + 0.2, 1.1, '#ffffff'); p.dot(hx + 1.2, hy + 0.2, 0.5, CMD.shade);
+    p.dot(hx + 1.2, hy + 2.0, 1, CMD.shade);
+  } else {
+    p.r(hx + 0.6, hy - 0.2, 1, 1, CMD.shade); p.r(hx + 2.4, hy - 0.2, 1, 1, CMD.shade);
+  }
+}
+function soldierPose(e) {
+  const s = { cr: 0, bob: 0, hd: 0, face: 'n', hold: null, extra: null, lf: [12, 21], lb: [8, 21], af: 1.35, ab: 1.9 };
+  if (e.dead) { s.face = 'x'; s.lf = [14, 20]; s.lb = [5, 20]; s.af = -1.8; s.ab = -2.4; return s; }
+  if (e.ent > 0) { s.lf = [13, 19]; s.lb = [8, 20]; s.af = -1.1; s.ab = -2.3; return s; }
+  if (e.st === 'panic') {
+    s.face = 'p';
+    s.af = -1.2 + Math.sin(T * 26 + e.seed) * 0.7; s.ab = -1.4 + Math.cos(T * 22 + e.seed) * 0.7;
+    const k = Math.round(Math.sin(T * 20 + e.seed) * 2);
+    s.lf = [12 + k, 21]; s.lb = [8 - k, 21];
+    return s;
+  }
+  const moving = e.onGround && Math.abs(e.vx) > 4;
+  if (!e.onGround) { s.lf = [13, 20]; s.lb = [6, 21]; s.af = -0.3; s.ab = 2.4; }
+  else if (e.st === 'cover') { s.cr = 1; s.lf = [14, 21]; s.lb = [5, 21]; s.af = 0.2; s.ab = 0.5; s.hold = 'gun'; }
+  else if (moving) {
+    const ph = e.t * Math.abs(e.vx) * 0.11, c1 = Math.cos(ph), c2 = -c1, s1 = Math.sin(ph), s2 = -s1;
+    s.lf = [Math.round(12 + c1 * 3), 21 - (s1 > 0 ? Math.round(s1 * 2) : 0)];
+    s.lb = [Math.round(8 + c2 * 3), 21 - (s2 > 0 ? Math.round(s2 * 2) : 0)];
+    s.bob = Math.abs(s1) > 0.8 ? 1 : 0;
+    s.af = 1.35 + c2 * 0.5; s.ab = 1.9 + c1 * 0.5;
+  }
+  switch (e.k) {
+    case 'grunt': if (e.cd > 0.8 && !moving) { s.hold = 'gun'; s.af = 0; s.ab = 0.15; } break;
+    case 'rusher':
+      s.hold = 'knife';
+      s.af = e.atk > 0 ? lerp(-1.4, 1.4, 1 - e.atk / 0.26) : 0.3;
+      break;
+    case 'sniper': {
+      const dxs = (e.aimX - e.x) * e.face, dy = e.aimY - (e.y - 10);
+      s.hold = 'rifle'; s.af = e.st === 'aim' ? Math.atan2(dy, Math.max(4, dxs)) : 0; s.ab = s.af + 0.1;
+      break;
+    }
+    case 'runner': s.extra = 'dyn'; break;
+    case 'barrel': if (e.carry) { s.extra = 'barrel'; s.af = -0.2; s.ab = 0.5; } break;
+  }
+  return s;
+}
+const qk = v => Math.round(v * 10);
+function poseKey(s) {
+  return [s.cr, s.bob, s.hd, s.face, s.hold, s.extra, s.lf.join(','), s.lb.join(','), qk(s.af), qk(s.ab)].join('|');
+}
+function paintHeavy(p, s) {
+  p.r(6, 22, 4, 7, '#3c4150'); p.r(14, 22, 4, 7, '#3c4150');
+  p.r(5, 27, 6, 3, '#1f1f26'); p.r(13, 27, 6, 3, '#1f1f26');
+  p.r(4, 12, 16, 12, '#5b6070'); p.r(5, 14, 14, 1, '#7a8192'); p.r(5, 19, 14, 1, '#7a8192'); p.r(4, 22, 16, 2, '#2b2f3a');
+  p.dot(4, 13, 3, '#444a5a'); p.dot(20, 13, 3, '#444a5a');
+  p.r(1, 14, 3, 8, '#444a5a'); p.r(20, 14, 3, 8, '#444a5a');
+  p.dot(12, 8, 4.5, '#303442');
+  p.r(8, 8, 9, 2, '#ff8a2b'); p.r(9, 8, 7, 1, '#ffd34d');
+  p.r(18, 15, 8, 4, '#2b2f3a'); p.r(23, 16, 3, 2, '#9aa3a8');
+}
+function paintTurret(p, a) {
+  p.r(3, 10, 12, 6, '#4a4f5c'); p.r(4, 9, 10, 2, '#6a7080'); p.dot(9, 8, 2.6, '#2b2f3a');
+  const ex = 9 + Math.cos(a) * 8, ey = 8 + Math.sin(a) * 8;
+  p.line(9, 8, ex, ey, 3, '#2b2f3a');
+  p.dot(ex, ey, 1.2, '#ff8a2b');
+}
+function paintDrone(p, rot) {
+  p.dot(10, 7, 4, '#3b4150'); p.r(6, 5, 8, 4, '#3b4150'); p.dot(10, 6, 2, '#7fd4ff');
+  p.r(3, 9, 14, 1, '#2b2f3a');
+  const rx = Math.cos(rot) * 9, ry = Math.sin(rot) * 1.2;
+  p.line(10 - rx, 2 - ry, 10 + rx, 2 + ry, 1.6, '#cfd6e0');
+  p.r(1, 6, 2, 1, '#cfd6e0');
+}
+function paintJeep(p, wph) {
+  p.r(2, 8, 30, 6, '#6d7a3a'); p.r(9, 3, 14, 5, '#4a5a2a'); p.r(11, 4, 5, 2, '#7fd4ff');
+  p.dot(16, 2, 2.6, '#c9b08a'); p.r(14, 1, 5, 2, '#3b4150');
+  p.line(22, 5, 30, 2, 1.5, '#1b1b1b');
+  for (const wx of [8, 26]) {
+    p.dot(wx, 14, 3.4, '#1b1b1b');
+    p.line(wx, 14, wx + Math.cos(wph) * 2.6, 14 + Math.sin(wph) * 2.6, 1, '#9aa3a8');
+  }
+}
+function paintTruck(p) {
+  p.r(12, 2, 32, 16, '#6b7d4f'); p.r(12, 14, 32, 2, '#4f5e3a');
+  p.r(20, 6, 2, 8, '#55663f'); p.r(30, 6, 2, 8, '#55663f');
+  p.r(0, 8, 13, 10, '#5b6b42'); p.r(2, 9, 6, 4, '#7fd4ff'); p.r(0, 17, 13, 2, '#4f5e3a');
+  for (const wx of [8, 22, 38]) { p.dot(wx, 20, 3.6, '#1b1b1b'); p.dot(wx, 20, 1.2, '#9aa3a8'); }
+}
+function paintChute(p) {
+  p.poly([[1, 9], [4, 3], [11, 0], [18, 3], [21, 9]], '#e53b2f');
+  p.poly([[8, 0.5], [11, 0], [11, 9], [8, 9]], '#f4f1ea');
+  p.line(1, 9, 11, 12, 0.6, '#222'); p.line(21, 9, 11, 12, 0.6, '#222');
+}
+function paintBarrel(p, hot) {
+  p.r(0, 0, 8, 10, '#c8432f'); p.r(0, 2, 8, 1, '#222'); p.r(0, 7, 8, 1, '#222');
+  p.r(0, 4, 8, 2, hot ? '#ffd34d' : '#e6b84a');
+}
+function paintRock(p) {
+  p.poly([[0, 5], [2, 1], [5, 0], [6, 4], [4, 6]], '#6b5448');
+  p.r(2, 2, 2, 1, '#8a6e5f');
+}
+function paintTruckSprite(p) { paintTruck(p); }
+
+function drawEnemies() {
+  for (const e of enemies) {
+    const sx = Math.round(scrX(e.x));
+    if (sx < -40 || sx > W + 40) continue;
+    if (e.k === 'sniper' && e.st === 'aim') drawSniperLaser(e);
+    const flash = e.hurt > 0.06;
+    if (e.k === 'turret') {
+      const a = Math.atan2(Math.sin(e.aimA), Math.cos(e.aimA) * e.face);
+      const q = Math.round(a * 8) / 8;
+      blit(sprite('turret' + q, 18, 16, p => paintTurret(p, q)), sx, e.y, e.face, 0, flash);
+    } else if (e.k === 'drone') {
+      const rot = Math.floor(T * 30) % 2 ? 0.5 : 1.5;
+      blit(sprite('drone' + rot, 20, 12, p => paintDrone(p, rot)), sx, e.y + 3, e.face, e.dead ? e.ang : 0, flash);
+    } else if (e.k === 'jeep') {
+      const wph = Math.round(e.wheel * 2) / 2;
+      blit(sprite('jeep' + wph, 34, 18, p => paintJeep(p, wph)), sx, e.y, e.dir, e.dead ? e.ang : 0, flash);
+    } else if (e.k === 'heavy') {
+      const s = soldierPose(e);
+      blit(sprite('heavy', 26, 30, p => paintHeavy(p, s)), sx, e.y, e.face, e.dead ? e.ang : 0, flash);
+    } else {
+      const s = soldierPose(e);
+      const pal = SOLDIER_PAL[e.k] || SOLDIER_PAL.grunt;
+      const wob = e.dead ? e.ang : e.hurt > 0.03 ? Math.sin(T * 50 + e.seed) * 0.15 : 0;   // wobble when hit
+      blit(sprite('sol|' + e.k + '|' + poseKey(s), 20, 24, p => paintSoldier(p, s, pal)), sx, e.y, e.face, wob, flash);
+    }
+    if (e.ek === 'drop' && e.ent > 0) blit(sprite('chute', 22, 12, paintChute), sx, e.y - 22, 1);
+  }
+}
+function drawSniperLaser(e) {
+  const x1 = Math.round(scrX(e.x + e.face * 4)), y1 = Math.round(e.y - 10);
+  const x2 = Math.round(scrX(e.aimX)), y2 = Math.round(e.aimY);
+  const len = Math.hypot(x2 - x1, y2 - y1), n = Math.max(1, Math.floor(len / 3));
+  g.fillStyle = '#ff3b3b';
+  for (let i = 0; i <= n; i++) {
+    if ((i + Math.floor(T * 20)) % 2) continue;
+    const f = i / n;
+    g.fillRect(Math.round(x1 + (x2 - x1) * f), Math.round(y1 + (y2 - y1) * f), 1, 1);
+  }
+}
+function drawEBullets() {
+  for (const b of ebul) {
+    const sx = Math.round(scrX(b.x)), sy = Math.round(b.y);
+    if (b.kind === 'missile') { g.fillStyle = '#e5e5e5'; g.fillRect(sx - 2, sy - 1, 4, 2); g.fillStyle = '#ff8a2b'; g.fillRect(sx - 3, sy, 1, 1); }
+    else if (b.kind === 'sniper') { g.fillStyle = '#ff4d6d'; g.fillRect(sx - 6, sy, 6, 1); g.fillStyle = '#ffd6de'; g.fillRect(sx, sy, 1, 1); }
+    else if (b.kind === 'shell') { g.fillStyle = '#ff8a2b'; g.fillRect(sx - 1, sy - 1, 3, 3); g.fillStyle = '#ffe27a'; g.fillRect(sx, sy, 1, 1); }
+    else { g.fillStyle = b.kind === 'mg' ? '#ffb347' : '#ffe066'; g.fillRect(sx - 1, sy, 2, 1); }
+  }
+}
+function drawHazards() {
+  for (const h of hz) {
+    const sx = Math.round(scrX(h.x));
+    if (sx < -16 || sx > W + 16) continue;
+    if (h.k === 'rock') blit(sprite('rock', 6, 6, paintRock), sx, h.y + 3, 1);
+    else {
+      const hot = h.k === 'hbarrel' || h.fuse < 1;
+      blit(sprite('barrel' + (h.k === 'hbarrel' ? 'y' : 'r') + (hot && Math.floor(T * 10) % 2 ? 'b' : ''), 8, 10, p => paintBarrel(p, h.k === 'hbarrel')), sx, h.y + 1, 1);
+    }
+  }
+}
+function drawTrucks() {
+  for (const tr of trucks) {
+    const sx = scrX(tr.x);
+    if (sx < -60 || sx > W + 60) continue;
+    blit(sprite('truck', 46, 24, paintTruckSprite), sx, GROUND_Y, 1);
+  }
+}
+
+// Ambush and wave data. Waves spawn when their lock triggers; entries are [kind, x, entrance, y].
+const WAVE_DATA = {
+  L1: [['grunt', 640], ['grunt', 668], ['rusher', 720], ['grunt', 600, 'drop']],
+  L2: [['grunt', 1300], ['grunt', 1330], ['barrel', 1400], ['runner', 1420], ['jeep', 1480]],
+  L3: [['turret', 1880], ['grunt', 1700], ['grunt', 1990, 'drop'], ['drone', 1820, 'fly', 46]],
+  L4: [['sniper', 2300, 'ground', 136], ['sniper', 2470, 'ground', 72], ['grunt', 2425, 'drop'], ['rusher', 2432], ['drone', 2560, 'fly', 96]],
+  L5: [['truck', 2900], ['heavy', 2950], ['barrel', 2820], ['turret', 2880]],
+  L6: [['grunt', 3186, 'window', 150], ['sniper', 3280, 'ground', 120], ['runner', 3100], ['rusher', 3120], ['grunt', 3060]],
+  L7: [['rusher', 4776, 'burst', 80], ['rusher', 4700], ['runner', 4640], ['runner', 4900], ['turret', 4930], ['barrel', 4850], ['hbarrel', 4650]],
+  L8: [['barrel', 5300], ['rusher', 5352, 'burst', 80], ['rusher', 5230], ['turret', 5440], ['hbarrel', 5200]],
+  BOSS: []
+};
+const PLACED = [
+  { id: 'P1', x: 1508, y: 120, k: 'sniper', trig: 1250 },
+  { id: 'P2', x: 2140, y: 104, k: 'sniper', trig: 1900 },
+  { id: 'P3', x: 4530, y: GROUND_Y, k: 'grunt', trig: 4380 }
+];
+
+// ============================================================
+// 13. RESCUE - tied-up captives, cut the rope or touch them; secret pockets hold two of them
+// ============================================================
+let caps = [];
+const CIV_PAL = { shirt: '#e0c24a', shirtD: '#b59a2e', pants: '#3b4a7a', pantsD: '#2a3556', skin: '#e8b08a', band: '#d64a4a', belt: '#4a3520' };
+const capRope = c => ({ l: c.x - 5, r: c.x + 5, t: c.y - 17, b: c.y - 9 });
+const capBody = c => ({ l: c.x - 5, r: c.x + 5, t: c.y - 22, b: c.y });
+
+function paintTied(p) {
+  p.r(17, 0, 2, 24, '#6b4a2b');                                         // post
+  p.r(4, 20, 11, 3, '#3b4a7a');                                         // legs stretched out
+  p.r(6, 12, 8, 8, '#e0c24a');                                          // shirt
+  p.dot(10, 8, 3.3, '#e8b08a'); p.r(7, 4, 7, 2, '#5a3b22');            // head and hair
+  p.line(6, 13, 14, 19, 1.4, '#8b5a2b'); p.line(14, 13, 6, 19, 1.4, '#8b5a2b');   // ropes across the chest
+}
+function updCaptives(dt) {
+  for (const c of caps) {
+    c.t += dt;
+    if (c.st === 'tied' && !P.dead && rectHit(boxOf(P), capBody(c))) freeCaptive(c);
+  }
+}
+function freeCaptive(c) {
+  if (c.st !== 'tied') return;
+  c.st = 'free'; c.t = 0;
+  G.done.add(c.id); G.rescued++;
+  SND.rescue();
+  addScore(500, c.x, c.y - 26);
+  floatText(c.x, c.y - 36, 'THANKS!', '#fff3a0');
+  spawnItem('weapon', c.x, c.y - 4, rr(-20, 20), -150, c.reward);
+  if (c.id === 'k2' || c.id === 'k4') G.msg = { text: 'SECRET FOUND!', t: 2.2 };
+  for (let i = 0; i < 10; i++) spawnPart(c.x, c.y - 12, rr(-80, 80), rr(-130, -40), rr(0.6, 1), pick(['#fff3a0', '#ff5a4a', '#7fd4ff']), 2, GRAV, 1);
+}
+function drawCaptives() {
+  for (const c of caps) {
+    const sx = scrX(c.x);
+    if (sx < -30 || sx > W + 30) continue;
+    if (c.st === 'tied') {
+      blit(sprite('cap-tied', 20, 24, paintTied), sx, c.y, 1);
+      if (Math.floor(T * 1.5 + c.x) % 4 === 0) text('HELP', sx, c.y - 34, '#ffffff', 1, 'c');
+    } else {
+      const dancing = c.t < 2.4;
+      const s = { cr: 0, bob: 0, hd: 0, face: 'n', hold: null, extra: null, lf: [12, 21], lb: [8, 21], af: 1.35, ab: 1.9 };
+      if (dancing) {
+        const k = Math.sin(T * 9 + c.x), up = k > 0 ? 1 : 0;
+        s.lf = [12 + Math.round(k * 2), 21]; s.lb = [8 - Math.round(k * 2), 21];
+        s.bob = up; s.af = -2.2 + k * 0.4; s.ab = -1.9 - k * 0.4; s.face = 'c';
+      } else {
+        s.af = -2.2 + Math.sin(T * 3 + c.x) * 0.35; s.ab = 1.6;
+      }
+      const key = 'cap-free|' + [s.bob, s.face, s.lf.join(','), s.lb.join(','), qk(s.af), qk(s.ab)].join('|');
+      blit(sprite(key, 20, 24, p => paintSoldier(p, s, CIV_PAL)), sx, c.y, c.x % 2 ? 1 : -1);
+    }
+  }
+}
+
+// ============================================================
+// 14. VEHICLE - the armoured tracked tank at the midpoint: drive, hop, crush, shoot, eject
+// ============================================================
+let TANK = null;
+const TANK_MG = { cd: 0.09, speed: 360, dmg: 1, col: '#ffe066', spread: 0.035, life: 1.2 };
+const TANK_CANNON = { cd: 0.9, speed: 250, dmg: 3, col: '#ffb347', spread: 0, explode: true, life: 1.6 };
+
+function makeTank(x) {
+  return {
+    x, y: GROUND_Y, vx: 0, vy: 0, w: 24, h: 18, face: 1, hp: 8, maxHp: 8, cdM: 0, cdC: 0, hurt: 0,
+    dead: false, susp: 0, suspV: 0, track: 0, aim: 0, onGround: false, occ: false
+  };
+}
+function tryEnterTank() {
+  if (!TANK || TANK.dead || P.dead) return;
+  if (!rectHit(boxOf(P), { l: TANK.x - 16, r: TANK.x + 16, t: TANK.y - 26, b: TANK.y + 2 })) return;
+  P.inTank = true; P.climbing = false; TANK.occ = true;
+  floatText(TANK.x, TANK.y - 30, 'DRIVE!', '#ffe066');
+}
+function exitTank() {
+  if (!TANK.onGround) return;
+  P.inTank = false; TANK.occ = false;
+  P.x = TANK.x - TANK.face * 16; P.y = GROUND_Y; P.vx = 0; P.vy = 0; P.onGround = true; P.inv = 0.6;
+}
+function fireTank(kind) {
+  const tk = TANK, w = kind === 'mg' ? TANK_MG : TANK_CANNON;
+  const dx = tk.face * Math.cos(tk.aim), dy = Math.sin(tk.aim);
+  const m = { x: tk.x + dx * 12, y: tk.y - 13 + dy * 12 };
+  addPBullet(m, Math.atan2(dy, dx) + rr(-w.spread, w.spread), w, kind);
+  SND.shot(kind === 'mg' ? 'mg' : 'rocket');
+}
+function driveTank() {
+  const tk = TANK;
+  const ax = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+  tk.vx = approach(tk.vx, ax * 74, 240 * STEP);
+  if (ax) tk.face = ax;
+  if (pressed('jump') && tk.onGround) { tk.vy = -165; tk.suspV -= 60; SND.jump(); }
+  tk.aim = held.up ? -0.5 : held.down ? 0.2 : 0;
+  if (held.fire && tk.cdM <= 0) { fireTank('mg'); tk.cdM = TANK_MG.cd; }
+  if (pressed('grenade') && tk.cdC <= 0) { fireTank('cannon'); tk.cdC = TANK_CANNON.cd; }
+  if (pressed('use')) exitTank();
+}
+function updVehicle(dt) {
+  if (!P.inTank && pressed('use')) tryEnterTank();
+  if (!TANK) return;
+  const tk = TANK;
+  tk.cdM = Math.max(0, tk.cdM - dt); tk.cdC = Math.max(0, tk.cdC - dt); tk.hurt = Math.max(0, tk.hurt - dt);
+  if (!tk.dead) {
+    if (P.inTank) driveTank();
+    if (P.inTank && tk.dead) P.inTank = false;
+    if (tk.hp <= 3 && Math.random() < dt * 6) spawnPart(tk.x + rr(-6, 6), tk.y - 14, rr(-6, 6), rr(-26, -14), rr(0.8, 1.3), '#8d8794', rr(3, 5), -10, 0.5, 'smoke');
+  }
+  const wasAir = !tk.onGround;
+  tk.vy = Math.min(tk.vy + GRAV * dt, MAX_FALL);
+  if (moveX(tk, tk.vx * dt)) tk.vx = 0;
+  moveY(tk, tk.vy * dt);
+  if (tk.onGround && wasAir) tk.suspV += 90;
+  if (!tk.dead) tk.vx = tk.vx * (tk.onGround ? 1 : 0.98);
+  const target = tk.onGround ? 0 : -2;                      // leaf-spring suspension
+  tk.suspV += (-(tk.susp - target) * 140 - tk.suspV * 9) * dt;
+  tk.susp += tk.suspV * dt;
+  tk.track += tk.vx * dt * 0.25;
+  if (G.lock && tk.x > G.lock.cam - 30 && tk.x < G.lock.cam + W + 30) tk.x = clamp(tk.x, G.lock.left, G.lock.right);
+  tk.x = clamp(tk.x, 14, LW - 14);
+  if (!tk.dead && (Math.abs(tk.vx) > 15 || tk.vy > 90)) crushEnemies(tk);
+  if (!tk.dead && tk.y > TH * TS + 16) destroyTank();
+}
+function crushEnemies(tk) {
+  const tb = boxOf(tk);
+  for (const e of enemies) {
+    if (e.dead || e.ent > 0 || !rectHit(boxOf(e), tb)) continue;
+    if (e.k === 'heavy' || e.k === 'turret' || e.k === 'jeep') hurtEnemy(e, 1, { vx: tk.vx });
+    else { killEnemy(e); floatText(e.x, e.y - e.h - 6, 'SPLAT!', '#ffd34d'); SND.crush(); }
+  }
+  if (!P.inTank && !P.dead && rectHit(boxOf(P), tb)) hurtPlayer(1, sgn(P.x - tk.x));
+}
+function hurtTank(d) {
+  if (!TANK || TANK.dead) return;
+  TANK.hp -= d; TANK.hurt = 0.15;
+  spawnPart(TANK.x + rr(-8, 8), TANK.y - 12, rr(-40, 40), rr(-60, -10), rr(0.3, 0.5), '#fff3a0', 1.5, 200, 2);
+  SND.hit();
+  if (TANK.hp <= 0) destroyTank();
+}
+function destroyTank() {
+  const tk = TANK;
+  if (!tk || tk.dead) return;
+  tk.dead = true;
+  G.done.add('tank');
+  boom(tk.x, tk.y - 9, 34, 3, true);
+  shake(6);
+  if (P.inTank) {
+    P.inTank = false; tk.occ = false;
+    P.x = tk.x; P.y = tk.y; P.vx = -tk.face * 60; P.vy = -230; P.inv = 1.5; P.onGround = false;
+    floatText(tk.x, tk.y - 30, 'EJECT!', '#ffe066');
+  }
+}
+function paintTank(p, s) {
+  p.r(2, 10, 26, 8, '#5b6b3a'); p.r(3, 9, 24, 2, '#7a8b4a');
+  p.r(0, 16, 30, 6, '#2b2b2b');
+  for (let i = 0; i < 5; i++) p.dot(3 + i * 6 + s.tr, 19, 2.2, '#5a5a5a');
+  p.dot(13, 8, 5, '#6b7c42'); p.r(13, 6, 5, 3, '#6b7c42');
+  p.line(14, 7, 14 + Math.cos(s.a) * 14, 7 + Math.sin(s.a) * 14, 2.4, '#3b4023');
+  if (s.occ) { p.dot(16, 4, 2.4, '#f2b98c'); p.r(14, 3, 5, 1, '#e53b2f'); }
+  if (s.dmg) { p.r(5, 12, 3, 2, '#2a2a2a'); p.r(20, 12, 4, 2, '#2a2a2a'); }
+}
+function drawTank() {
+  if (!TANK) return;
+  const tk = TANK, sx = scrX(tk.x);
+  if (sx < -40 || sx > W + 40) return;
+  const s = {
+    tr: ((Math.round(tk.track) % 5) + 5) % 5, a: Math.round(tk.aim * 8) / 8,
+    occ: tk.occ, dmg: tk.hp <= 3 || tk.dead
+  };
+  const key = 'tank|' + [s.tr, s.a, s.occ ? 1 : 0, s.dmg ? 1 : 0].join('|');
+  blit(sprite(key, 30, 22, p => paintTank(p, s)), sx, tk.y + Math.round(tk.susp), tk.face, 0, tk.hurt > 0.05);
+}
+
+// ============================================================
+// 15. BOSS - COLOSSUS MK-IV: armoured hull, a cockpit weak point, two arms and a missile pod that break off
+// ============================================================
+let BOSS = null;
+let bdebris = [];                  // broken-off pieces tumbling to the ground
+let bbeams = [];                   // sweeping laser beams
+const BOSS_HULL = 40, BOSS_CORE = 40, BOSS_ARM = 16, BOSS_POD = 16;
+const BOSS_BODY = { l: -26, r: 26, t: -74, b: 0 };
+
+function startBoss() {
+  BOSS = {
+    x: 6000, y: -150, vy: 0, vx: 0, face: -1,
+    hull: BOSS_HULL, core: BOSS_CORE, armF: BOSS_ARM, armB: BOSS_ARM, pod: BOSS_POD,
+    att: { armF: true, armB: true, pod: true },
+    st: 'drop', tm: 0, atk: '', cd: 1, phase: 1, step: 0, dying: false, dT: 0, hurt: 0, boomed: false, charge: 0, beamLen: 0
+  };
+  bdebris = []; bbeams = [];
+  G.msg = { text: 'WARNING!', t: 2.4 };
+  SND.roar();
+}
+function bossFrac() { return (BOSS.hull + BOSS.core) / (BOSS_HULL + BOSS_CORE); }
+
+// World-space hit boxes for every part that can still be hit.
+function bossBoxes() {
+  const B = BOSS, f = B.face, bx = B.x, by = B.y;
+  const span = (a, c) => (f > 0 ? { l: bx + a, r: bx + c } : { l: bx - c, r: bx - a });
+  const out = [{ id: 'core', ...span(6, 22), t: by - 66, b: by - 50 }];
+  if (B.att.armF) out.push({ id: 'armF', ...span(22, 40), t: by - 62, b: by - 42 });
+  if (B.att.armB) out.push({ id: 'armB', ...span(-40, -22), t: by - 62, b: by - 42 });
+  if (B.att.pod) out.push({ id: 'pod', ...span(-12, 12), t: by - 92, b: by - 74 });
+  out.push({ id: 'hull', ...span(-26, 26), t: by - 74, b: by - 30 });
+  return out;
+}
+function hitBoss(id, dmg) {
+  const B = BOSS;
+  if (!B || B.dying || B.st === 'drop') return false;
+  if (id === 'core') B.core = Math.max(0, B.core - dmg);
+  else if (id === 'hull') { B.hull = Math.max(0, B.hull - dmg * 0.5); if (dmg >= 1) spawnPart(B.x + rr(-20, 20), B.y - rr(35, 60), rr(-40, 40), rr(-60, -10), rr(0.3, 0.5), '#cfd6e0', 1.5, 200, 2); }
+  else {
+    B[id] = Math.max(0, B[id] - dmg);
+    if (B[id] <= 0 && B.att[id]) detachPart(id);
+  }
+  B.hurt = 0.1;
+  SND.hit();
+  if (B.core <= 0) startBossDeath();
+  return true;
+}
+function hitBossAt(b) {
+  if (!BOSS || BOSS.dying || BOSS.st === 'drop') return false;
+  for (const box of bossBoxes()) if (inRect(b.x, b.y, box)) return hitBoss(box.id, b.dmg);
+  return false;
+}
+function hurtBossIn(x, y, rad, dmg) {
+  if (!BOSS || BOSS.dying || BOSS.st === 'drop') return;
+  for (const box of bossBoxes()) {
+    const cx = (box.l + box.r) / 2, cy = (box.t + box.b) / 2;
+    if (dist(cx, cy, x, y) < rad + 14) hitBoss(box.id, dmg);
+  }
+}
+function laserHitBoss(x1, y1, x2, y2, dmg) {
+  if (!BOSS || BOSS.dying || BOSS.st === 'drop') return;
+  for (const box of bossBoxes()) {
+    sampleAlong(x1, y1, x2, y2, (px, py) => {
+      if (!inRect(px, py, box)) return false;
+      hitBoss(box.id, dmg);
+      return true;
+    });
+  }
+}
+function meleeBoss(r) {
+  if (!BOSS || BOSS.dying || BOSS.st === 'drop') return;
+  for (const box of bossBoxes()) if (rectHit(box, r)) { hitBoss(box.id, 2); return; }
+}
+
+// A part that reaches zero health tears off, leaving a stump.
+function detachPart(id) {
+  const B = BOSS, f = B.face;
+  B.att[id] = false;
+  const x = id === 'pod' ? B.x : B.x + f * 31, y = id === 'pod' ? B.y - 84 : B.y - 52;
+  bdebris.push({ id, x, y, vx: id === 'pod' ? rr(-30, 30) : f * rr(40, 70), vy: -170, ang: 0, spin: rr(-7, 7), w: 14, h: 12, dead: false });
+  for (let i = 0; i < 10; i++) spawnPart(x + rr(-8, 8), y + rr(-6, 6), rr(-90, 90), rr(-120, -30), rr(0.4, 0.8), pick(['#ffd34d', '#ff8a2b', '#8d8794']), rr(2, 3), GRAV, 1);
+  floatText(x, y - 10, 'BREAK!', '#ffd34d');
+  shake(5);
+  SND.crate();
+}
+function updBossDebris(dt) {
+  for (const d of bdebris) {
+    d.vy = Math.min(d.vy + GRAV * dt, MAX_FALL);
+    d.x += d.vx * dt; d.y += d.vy * dt; d.ang += d.spin * dt;
+    if (d.y >= GROUND_Y - 6) { d.y = GROUND_Y - 6; d.vy = -Math.abs(d.vy) * 0.3; d.vx *= 0.6; d.spin *= 0.6; }
+  }
+}
+function pickAttack() {
+  const B = BOSS, opts = [];
+  if (B.att.armF || B.att.armB) opts.push('slam', 'slam');
+  if (B.att.pod) opts.push('missile', 'missile');
+  if (B.phase >= 2) opts.push('chain', 'bombs', 'leap');
+  if (B.phase >= 3 && (B.att.armF || B.att.armB)) opts.push('lasers');
+  if (!opts.length) opts.push('chain');
+  return pick(opts);
+}
+function startAttack(name) {
+  const B = BOSS;
+  B.atk = name; B.step = 0;
+  if (name === 'slam') { B.tx = P.x; B.tm = 0.9; B.st = 'slamWind'; }
+  else if (name === 'missile') { B.tm = 1.2; B.st = 'missile'; B.shots = 0; }
+  else if (name === 'chain') { B.tm = 1.6; B.st = 'chain'; }
+  else if (name === 'bombs') { B.tm = 1.8; B.st = 'bombs'; B.shots = 0; }
+  else if (name === 'leap') { B.st = 'leap'; B.vy = -330; B.vx = clamp((P.x - B.x) / 0.9, -220, 220); }
+  else if (name === 'lasers') { B.tm = 1.0; B.st = 'charge'; }
+}
+function bossFire(from, to, speed, dmg, kind, spread) {
+  shootEnemy(from.x, from.y, to.x, to.y, speed, dmg, kind, spread);
+}
+function updBoss(dt) {
+  if (!BOSS) return;
+  const B = BOSS;
+  B.hurt = Math.max(0, B.hurt - dt);
+  updBossDebris(dt);
+  if (B.dying) { updBossDeath(dt); return; }
+  B.phase = bossFrac() > 0.66 ? 1 : bossFrac() > 0.33 ? 2 : 3;
+  if (bossFrac() < 0.6 && Math.random() < dt * (bossFrac() < 0.3 ? 10 : 4)) {
+    spawnPart(B.x + rr(-20, 20), B.y - rr(40, 70), rr(-6, 6), rr(-22, -10), rr(0.9, 1.4), '#6d6470', rr(4, 6), -10, 0.4, 'smoke');
+  }
+  if (bossFrac() < 0.3 && Math.random() < dt * 8) spawnPart(B.x + rr(-24, 24), B.y - rr(40, 70), rr(-60, 60), rr(-80, -20), rr(0.2, 0.4), '#fff3a0', 1.5, 200, 2);
+  // the body hurts whoever stands under it
+  if (!P.dead && !P.inTank && B.st !== 'drop' && rectHit(boxOf(P), { l: B.x - 26, r: B.x + 26, t: B.y - 74, b: B.y })) hurtPlayer(1, sgn(P.x - B.x));
+  if (B.st === 'drop') {
+    B.vy = Math.min(B.vy + GRAV * 0.6 * dt, 360);
+    B.y += B.vy * dt;
+    if (B.y >= GROUND_Y) {
+      B.y = GROUND_Y; B.vy = 0; B.st = 'idle'; B.tm = 1.2;
+      shake(9);
+      for (let i = 0; i < 18; i++) spawnPart(B.x + rr(-40, 40), GROUND_Y - 2, rr(-90, 90), rr(-70, -10), rr(0.5, 0.9), '#d7b27a', rr(2, 4), GRAV, 1.5);
+      SND.boom(40);
+    }
+    return;
+  }
+  // face the player unless mid-leap
+  if (B.st !== 'leap') B.face = P.x >= B.x ? 1 : -1;
+  const lk = G.lock || { left: 5800, right: 6184 };
+  const minX = lk.left + 40, maxX = lk.right - 40;
+  B.cd -= dt;
+  switch (B.st) {
+    case 'idle':
+      B.tm -= dt;
+      if (B.tm <= 0) {
+        if (Math.abs(P.x - B.x) > 110 && Math.random() < 0.6) { B.st = 'walk'; B.tm = rr(0.8, 1.4); }
+        else startAttack(pickAttack());
+      }
+      break;
+    case 'walk':
+      B.tm -= dt; B.step += dt * 6;
+      B.x = clamp(B.x + B.face * 22 * dt, minX, maxX);
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = rr(0.5, 1); }
+      break;
+    case 'slamWind':
+      B.tm -= dt;
+      if (B.tm <= 0) { B.st = 'slamHit'; B.tm = 0.22; shake(5); SND.boom(12); }
+      break;
+    case 'slamHit': {
+      B.tm -= dt;
+      if (B.tm > 0.1 && !P.dead && P.onGround && Math.abs(P.x - B.tx) < 20) hurtPlayer(1, sgn(P.x - B.tx));
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = rr(0.9, 1.3); }
+      break;
+    }
+    case 'missile':
+      B.tm -= dt;
+      if (B.shots < 3 && B.tm < 1.2 - (B.shots + 1) * 0.3) {
+        const sx = B.x, sy = B.y - 88;
+        ebul.push({ x: sx, y: sy, vx: rr(-60, 60), vy: -150, dmg: 1, kind: 'missile', life: 4, dead: false, home: true });
+        B.shots++;
+        SND.shot('rocket');
+      }
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = B.phase === 3 ? 0.6 : rr(0.9, 1.3); }
+      break;
+    case 'chain':
+      B.tm -= dt;
+      if (B.cd <= 0 && !P.dead) {
+        bossFire({ x: B.x + B.face * 30, y: B.y - 52 }, P, 170, 1, 'mg', 0.16);
+        B.cd = 0.09;
+      }
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = rr(0.8, 1.2); }
+      break;
+    case 'bombs':
+      B.tm -= dt;
+      if (B.shots < 6 && B.tm < 1.8 - (B.shots + 1) * 0.28) {
+        const bxp = rr(minX, maxX);
+        gren.push({ x: bxp, y: 16, vx: 0, vy: 40, w: 4, h: 4, t: 4, bounces: 0, onGround: false, from: 'e', dead: false, rad: 24, dmg: 1, bomb: true });
+        B.shots++;
+      }
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = rr(0.8, 1.2); }
+      break;
+    case 'leap':
+      B.vy = Math.min(B.vy + GRAV * 1.1 * dt, 400);
+      B.x = clamp(B.x + B.vx * dt, minX, maxX);
+      B.y += B.vy * dt;
+      if (B.y >= GROUND_Y && B.vy > 0) {
+        B.y = GROUND_Y; B.vy = 0; B.vx = 0;
+        shake(9); SND.boom(30);
+        for (let i = 0; i < 16; i++) spawnPart(B.x + rr(-50, 50), GROUND_Y - 2, rr(-120, 120), rr(-60, -10), rr(0.5, 0.9), '#d7b27a', rr(2, 4), GRAV, 1.5);
+        if (!P.dead && P.onGround && Math.abs(P.x - B.x) < 70) hurtPlayer(1, sgn(P.x - B.x));
+        B.st = 'idle'; B.tm = rr(0.9, 1.3);
+      }
+      break;
+    case 'charge':
+      B.tm -= dt; B.charge = 1 - B.tm;
+      if (B.tm <= 0) { B.st = 'beam'; B.tm = 1.4; B.beamLen = 0; SND.roar(); }
+      break;
+    case 'beam':
+      B.tm -= dt;
+      B.beamLen = Math.min(330, B.beamLen + 500 * dt);
+      {
+        const f = B.face, x1 = B.x + f * 30, x2 = x1 + f * B.beamLen, yy = GROUND_Y - 8;
+        bbeams = [{ x1, x2, y: yy, t: 0.12, col: '#ff5a3c' }];
+        if (!P.dead && !P.inTank && P.y - 16 < yy + 3 && P.y > yy - 2 && Math.min(x1, x2) < P.x + 4 && Math.max(x1, x2) > P.x - 4) {
+          hurtPlayer(1, f);
+        }
+      }
+      if (B.tm <= 0) { B.st = 'idle'; B.tm = rr(0.6, 1.0); bbeams = []; B.charge = 0; }
+      break;
+  }
+  // a few more ambient attacks in phase 3
+  if (B.phase === 3 && B.st === 'idle' && B.cd <= 0) B.cd = 3;
+}
+function startBossDeath() {
+  const B = BOSS;
+  if (B.dying) return;
+  B.dying = true; B.dT = 0; B.st = 'dead';
+  P.victory = true; P.shield = 99; P.inTank = false;
+  for (const k of ['armF', 'armB', 'pod']) if (B.att[k]) detachPart(k);
+  addScore(5000, B.x, B.y - 100);
+  G.msg = { text: 'BOSS DOWN!', t: 3 };
+  SND.boom(50);
+}
+function updBossDeath(dt) {
+  const B = BOSS;
+  B.dT += dt;
+  if (Math.random() < dt * 9) boom(B.x + rr(-34, 34), B.y - rr(16, 84), rr(10, 16), 0, true);   // chain reaction
+  if (!B.boomed && B.dT > 3.4) {
+    B.boomed = true;
+    boom(B.x, B.y - 40, 64, 0, true);
+    shake(14);
+  }
+  if (B.dT > 5.4) {
+    BOSS = null; bbeams = [];
+    G.lock = null;
+    G.won = true;
+    go(Complete);
+  }
+}
+function drawBoss() {
+  if (!BOSS) return;
+  const B = BOSS, f = B.face, bx = Math.round(scrX(B.x)), by = Math.round(B.y);
+  // telegraphs
+  if (B.st === 'drop') {
+    const a = Math.min(0.5, (1 - Math.min(1, (GROUND_Y - B.y) / 150)) * 0.5);
+    g.globalAlpha = a; g.fillStyle = '#000'; g.fillRect(bx - 34, GROUND_Y - 2, 68, 3); g.globalAlpha = 1;
+  }
+  if (B.st === 'slamWind') {
+    const tx = Math.round(scrX(B.tx));
+    g.fillStyle = Math.floor(T * 10) % 2 ? '#ff5a3c' : '#7a1e1e';
+    g.fillRect(tx - 18, GROUND_Y - 2, 36, 2);
+  }
+  // legs stepping when walking
+  const stepA = B.st === 'walk' ? Math.sin(B.step) : 0;
+  const legs = [[-20, stepA], [4, -stepA]];
+  for (const [dx, s] of legs) {
+    const lift = s > 0 ? Math.round(s * 4) : 0;
+    blit(sprite('bleg' + lift, 16, 34, p => paintBossLeg(p, lift)), Math.round(scrX(B.x + dx)), by - lift, 1);
+  }
+  blit(sprite('bhull' + Math.floor(B.hull / 8), 56, 44, p => paintBossHull(p, B.hull / BOSS_HULL)), Math.round(scrX(B.x)), by - 30, f, 0, B.hurt > 0.05);
+  // cockpit core, colour shifts from amber to red as it weakens
+  const core = B.core / BOSS_CORE;
+  const cx = Math.round(scrX(B.x + f * 14)), cy = by - 58;
+  g.fillStyle = core > 0.5 ? '#ffb347' : '#ff3b3b';
+  g.globalAlpha = B.dying ? 0.4 : 0.6 + 0.4 * Math.sin(T * 6);
+  g.fillRect(cx - 4, cy - 4, 8, 8);
+  g.globalAlpha = 1;
+  g.fillStyle = '#fff6c2'; g.fillRect(cx - 1, cy - 1, 2, 2);
+  if (B.att.armF) blit(sprite('barm' + (B.charge > 0.5 ? 'g' : ''), 22, 20, p => paintBossArm(p, B.charge > 0.5 || B.st === 'beam')), Math.round(scrX(B.x + f * 31)), by - 42, f, 0, B.hurt > 0.05);
+  if (B.att.armB) blit(sprite('barm' + (B.charge > 0.5 ? 'g' : ''), 22, 20, p => paintBossArm(p, B.charge > 0.5 || B.st === 'beam')), Math.round(scrX(B.x - f * 31)), by - 42, f, 0, B.hurt > 0.05);
+  if (B.att.pod) blit(sprite('bpod', 24, 16, paintBossPod), Math.round(scrX(B.x)), by - 74, 1, 0, B.hurt > 0.05);
+  // telegraphed missile pods / beam glow
+  if (B.st === 'beam') {
+    const x1 = Math.round(scrX(B.x + f * 30)), x2 = Math.round(scrX(B.x + f * (30 + B.beamLen)));
+    g.fillStyle = '#ff5a3c'; g.fillRect(Math.min(x1, x2), GROUND_Y - 10, Math.abs(x2 - x1), 4);
+  }
+}
+function paintBossHull(p, hp) {
+  p.r(0, 0, 56, 44, '#2a2f3b'); p.r(2, 2, 52, 40, '#5b6273');
+  p.r(0, 14, 56, 2, '#2a2f3b'); p.r(0, 30, 56, 2, '#2a2f3b');
+  for (let x = 4; x < 56; x += 8) { p.dot(x, 8, 1, '#8a92a4'); p.dot(x, 36, 1, '#8a92a4'); }
+  p.r(4, 4, 6, 4, '#2a2f3b'); p.r(44, 4, 6, 4, '#2a2f3b');
+  p.r(20, 20, 16, 3, '#ffd34d');                                  // warning stripe
+  if (hp < 0.8) p.r(30, 18, 10, 6, '#1f232d');
+  if (hp < 0.5) { p.line(20, 10, 34, 24, 1, '#1a1e26'); p.line(44, 6, 36, 20, 1, '#1a1e26'); }
+}
+function paintBossArm(p, glow) {
+  p.r(0, 4, 14, 12, '#5b6273'); p.r(2, 6, 10, 2, '#7a8192');
+  p.r(12, 7, 10, 5, '#2a2f3b');
+  if (glow) p.dot(20, 9.5, 2.6, '#ff8a2b');
+}
+function paintBossPod(p) {
+  p.r(0, 4, 24, 10, '#4b5263');
+  for (let i = 0; i < 3; i++) { p.dot(4 + i * 8, 8, 2.8, '#2a2f3b'); p.dot(4 + i * 8, 8, 1.4, '#ff4d6d'); }
+}
+function paintBossLeg(p, lift) {
+  p.r(3, 0, 10, 14, '#4b5263');
+  p.r(4, 12, 8, 16 - lift, '#3c4150');
+  p.r(0, 26 - lift, 16, 6, '#2a2f3b');
+}
+function drawBossDebris() {
+  for (const d of bdebris) {
+    const sx = Math.round(scrX(d.x));
+    if (sx < -20 || sx > W + 20) continue;
+    blit(sprite('bdeb' + d.id, 14, 12, p => (d.id === 'pod' ? paintBossPod(p) : paintBossArm(p, false))), sx, d.y + 6, 1, d.ang);
+  }
+  for (const b of bbeams) {
+    const a = b.t / 0.12;
+    g.globalAlpha = 0.5 + 0.5 * a;
+    g.fillStyle = b.col; g.fillRect(Math.round(scrX(Math.min(b.x1, b.x2))), Math.round(b.y) - 2, Math.round(Math.abs(b.x2 - b.x1)), 5);
+    g.fillStyle = '#fff3d6'; g.fillRect(Math.round(scrX(Math.min(b.x1, b.x2))), Math.round(b.y), Math.round(Math.abs(b.x2 - b.x1)), 1);
+    g.globalAlpha = 1;
+  }
+}
+function updBossFx(dt) {
+  for (const b of bbeams) b.t -= dt;
+  bbeams = bbeams.filter(b => b.t > 0);
+}
+
+// ============================================================
+// 16. HUD, FEEDBACK AND SCREENS - score, lives, health, ammo, messages, pause, game over, stage clear
+// ============================================================
+const CAPTIVE_TOTAL = 5;
+let hitStop = 0, flashA = 0, hurtFlash = 0;
+const pad = (n, len) => String(n).padStart(len, '0');
+
+function saveHi() {
+  if (G.score > G.hi) { G.hi = G.score; store.set('hi', G.hi); }
+}
+// Death: spend a life and return to the checkpoint, or show the game-over screen.
+function afterDeath() {
+  if (G.lives > 0) {
+    G.lives--;
+    restoreCheckpoint();
+    G.msg = { text: 'RETRY!', t: 1.4 };
+  } else {
+    saveHi();
+    go(GameOver);
+  }
+}
+function updFx(dt) {
+  flashA = Math.max(0, flashA - dt * 2.4);
+  hurtFlash = Math.max(0, hurtFlash - dt * 2.4);
+}
+// Big, wobbling title letters with a colour cycle.
+function textWave(str, cx, y, sc, t) {
+  const x0 = Math.round(cx - textW(str, sc) / 2);
+  const cols = ['#ffd34d', '#ff9a2b', '#ff5a4a'];
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i].toUpperCase();
+    const dy = Math.round(Math.sin(t * 4 + i * 0.7) * sc * 0.5);
+    const x = x0 + i * 4 * sc;
+    glyphs(ch, x + sc, y + dy + sc, '#140a1c', sc);
+    glyphs(ch, x, y + dy, cols[(i + Math.floor(t * 3)) % cols.length], sc);
+  }
+}
+function drawFlashes() {
+  if (flashA > 0) { g.globalAlpha = Math.min(0.6, flashA); g.fillStyle = '#fff6c2'; g.fillRect(0, 0, W, H); g.globalAlpha = 1; }
+  if (hurtFlash > 0) { g.globalAlpha = Math.min(0.3, hurtFlash); g.fillStyle = '#ff2a2a'; g.fillRect(0, 0, W, H); g.globalAlpha = 1; }
+}
+function drawHUD() {
+  panel(0, 0, W, 11, 0.55);
+  text('SCORE ' + pad(G.score, 6), 3, 3, '#ffffff', 1, 'l', false);
+  text('HI ' + pad(G.hi, 6), W / 2, 3, '#ffd34d', 1, 'c', false);
+  text('RESCUED ' + G.rescued + '/' + CAPTIVE_TOTAL, W - 3, 3, '#7fd4ff', 1, 'r', false);
+  panel(0, H - 11, W, 11, 0.55);
+  for (let i = 0; i < 3; i++) { g.fillStyle = i < P.hp ? '#ff4d6d' : '#3a2f44'; g.fillRect(3 + i * 7, H - 8, 5, 5); }
+  text('X' + G.lives, 27, H - 9, '#ffffff', 1, 'l', false);
+  const w = WEAPONS[G.weapon];
+  const ammo = G.weapon === 'pistol' ? 'INF' : String(G.ammo[G.weapon]);
+  text(w.name + ' ' + ammo, W / 2, H - 9, w.col, 1, 'c', false);
+  text('GRN ' + G.grenades, W - 3, H - 9, '#9be36b', 1, 'r', false);
+  if (P.shield > 0) text('SHIELD ' + Math.ceil(P.shield), 40, H - 9, '#7fd4ff', 1, 'l', false);
+  if (BOSS && !BOSS.dying && BOSS.st !== 'drop') drawBossBar();
+  if (P.inTank && TANK) drawTankBar();
+}
+function drawBossBar() {
+  const f = bossFrac();
+  text('COLOSSUS MK-IV', W / 2, 15, '#ffffff', 1, 'c');
+  g.fillStyle = '#ffffff'; g.fillRect(91, 22, 202, 8);
+  g.fillStyle = '#2a1520'; g.fillRect(92, 23, 200, 6);
+  g.fillStyle = f > 0.33 ? '#ff5a4a' : '#ff1f3d'; g.fillRect(92, 23, Math.round(200 * f), 6);
+  g.fillStyle = '#ffd6de'; g.fillRect(92, 23, Math.round(200 * f), 1);
+}
+function drawTankBar() {
+  text('TANK', 3, 15, '#e6f0a0', 1, 'l', false);
+  for (let i = 0; i < 8; i++) { g.fillStyle = i < TANK.hp ? '#8fd14f' : '#2e3a22'; g.fillRect(30 + i * 6, 15, 5, 5); }
+}
+function drawGoArrow() {
+  const x = W - 40 + Math.round(Math.sin(T * 8) * 3), y = 100;
+  g.fillStyle = '#ffd34d';
+  g.fillRect(x - 14, y - 3, 14, 6);
+  g.beginPath(); g.moveTo(x, y - 9); g.lineTo(x + 14, y); g.lineTo(x, y + 9); g.closePath(); g.fill();
+  g.fillStyle = INK_HEX; g.fillRect(x - 15, y - 4, 1, 8);
+}
+function drawPause() {
+  panel(0, 0, W, H, 0.65);
+  text('PAUSED', W / 2, 52, '#ffd34d', 3, 'c');
+  text('P OR ESC  RESUME', W / 2, 96, '#ffffff', 1, 'c');
+  text('Q  QUIT TO TITLE', W / 2, 110, '#ffffff', 1, 'c');
+  text('M  MUTE / UNMUTE', W / 2, 124, '#ffffff', 1, 'c');
+  text('ARROWS MOVE   SPACE JUMP   X FIRE   G GRENADE', W / 2, 154, '#c9b8d8', 1, 'c');
+  text('K KNIFE   Q WEAPON   E ENTER TANK   UP/DOWN AIM', W / 2, 166, '#c9b8d8', 1, 'c');
+}
+
+const GameOver = {
+  t: 0,
+  init() { this.t = 0; saveHi(); SND.music(null); SND.die(); },
+  update(dt) {
+    this.t += dt;
+    const left = 9 - this.t;
+    if (G.credits > 0 && left > 0 && (pressed('start') || pressed('jump') || pressed('fire'))) {
+      G.credits--;
+      G.lives = 3;
+      restoreCheckpoint();
+      go(Play);
+      return;
+    }
+    if (left <= 0) go(Title);
+  },
+  draw() {
+    drawSky('#2a0f1f', '#080409');
+    text('GAME OVER', W / 2, 46, '#ff5a4a', 3, 'c');
+    const left = Math.max(0, Math.ceil(9 - this.t));
+    if (G.credits > 0) {
+      text('CONTINUE? ' + left, W / 2, 104, '#ffe066', 2, 'c');
+      text('CREDITS ' + G.credits + '   PRESS START', W / 2, 130, '#ffffff', 1, 'c');
+      text('CONTINUE FROM THE CHECKPOINT WITH 3 LIVES', W / 2, 144, '#c9b8d8', 1, 'c');
+    } else {
+      text('NO CREDITS LEFT', W / 2, 104, '#ff9a4a', 2, 'c');
+    }
+    text('SCORE ' + pad(G.score, 6), W / 2, 170, '#ffffff', 1, 'c');
+    text('HI ' + pad(G.hi, 6), W / 2, 182, '#ffd34d', 1, 'c');
+  }
+};
+
+const Complete = {
+  t: 0, tally: [], total: 0, rank: 'C',
+  init() {
+    this.t = 0;
+    this.tally = [
+      ['SCORE', G.score],
+      ['CAPTIVES ' + G.rescued + '/' + CAPTIVE_TOTAL, G.rescued * 1000],
+      ['FULL RESCUE', G.rescued === CAPTIVE_TOTAL ? 5000 : 0],
+      ['HEALTH LEFT', P.hp * 500],
+      ['TIME BONUS', Math.max(0, 6000 - Math.floor(G.levelT) * 12)]
+    ];
+    this.total = this.tally.reduce((s, r) => s + r[1], 0);
+    this.rank = this.total >= 40000 ? 'S' : this.total >= 30000 ? 'A' : this.total >= 20000 ? 'B' : 'C';
+    G.score = this.total;
+    saveHi();
+    SND.music('menu');
+  },
+  update(dt) {
+    this.t += dt;
+    if (this.t > 1 && (pressed('start') || pressed('jump') || pressed('fire'))) go(Title);
+  },
+  draw() {
+    drawSky('#20142e', '#0b0712');
+    textWave('STAGE CLEAR', W / 2, 16, 3, this.t);
+    let y = 58;
+    this.tally.forEach((row, i) => {
+      if (this.t < 0.8 + i * 0.6) return;
+      text(row[0], 70, y, '#ffffff', 1, 'l');
+      text(String(row[1]), W - 70, y, '#ffe066', 1, 'r');
+      y += 13;
+    });
+    if (this.t > 0.8 + this.tally.length * 0.6) {
+      text('TOTAL ' + this.total, W / 2, y + 6, '#ffffff', 2, 'c');
+      const col = this.rank === 'S' ? '#ffd34d' : this.rank === 'A' ? '#7fd4ff' : this.rank === 'B' ? '#9be36b' : '#c9b8d8';
+      text('RANK ' + this.rank, W / 2, y + 28, col, 3, 'c');
+    }
+    if (this.t > 1 && Math.floor(this.t * 2) % 2 === 0) text('PRESS START', W / 2, H - 12, '#ffffff', 1, 'c');
+  }
+};
+
+// ============================================================
+// 17. BOOT
+// ============================================================
+setupTouch();
+fitCanvas();
+go(Title);
+lastNow = performance.now();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

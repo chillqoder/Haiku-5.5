@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mario 1-1 Low-Poly</title>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #5cc8ff; font-family: system-ui, -apple-system, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 16px; right: 16px;
+    display: flex; justify-content: space-between; pointer-events: none;
+    color: #fff; font-weight: 700; font-size: 20px;
+    text-shadow: 2px 2px 0 #3b2a1a, -1px -1px 0 #3b2a1a;
+    letter-spacing: 1px;
+  }
+  #hud .block { display: flex; flex-direction: column; gap: 2px; }
+  #hud .label { font-size: 12px; opacity: 0.85; }
+  #msg {
+    position: fixed; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    color: #fff; font-size: 44px; font-weight: 800; letter-spacing: 2px;
+    text-shadow: 3px 3px 0 #3b2a1a; background: rgba(30, 60, 110, 0.25); pointer-events: none;
+  }
+  #msg small { font-size: 18px; font-weight: 600; margin-top: 12px; letter-spacing: 1px; }
+  #help {
+    position: fixed; left: 16px; bottom: 12px; color: #fff; font-size: 13px;
+    opacity: 0.85; text-shadow: 1px 1px 0 #3b2a1a; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="block"><span class="label">SCORE</span><span id="score">000000</span></div>
+  <div class="block"><span class="label">COINS</span><span id="coins">x00</span></div>
+  <div class="block"><span class="label">TIME</span><span id="time">400</span></div>
+</div>
+
+<div id="msg"></div>
+<div id="help">← → / A D move · Space jump · R restart</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  // ---------- Renderer / scene / camera ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const SKY = 0x5cc8ff;
+  scene.background = new THREE.Color(SKY);
+  scene.fog = new THREE.Fog(SKY, 80, 220);
+
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
+  camera.position.set(0, 6, 18);
+
+  // ---------- Soft lighting ----------
+  scene.add(new THREE.HemisphereLight(0xdff4ff, 0x6b8f3a, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff4e0, 0.9);
+  sun.position.set(20, 40, 15);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left: -60, right: 60, top: 40, bottom: -20, near: 1, far: 150 });
+  sun.shadow.camera.updateProjectionMatrix();
+  scene.add(sun);
+  scene.add(sun.target);
+
+  // ---------- Palette, helpers & seeded randomness ----------
+  const C = {
+    grass: 0x4caf3a, dirt: 0x9c6b3c, pipe: 0x2fbf4a, pipeRim: 0x1f8f37,
+    hill: 0x6fd65a, hillDark: 0x4cae3f, bush: 0x3fbf45, cloud: 0xffffff,
+    coin: 0xffd23f, mushroomCap: 0x9a5a2b, mushroomStem: 0xf3d9b1,
+    skin: 0xf2c49b, red: 0xe53935, blue: 0x2a5bd7, brown: 0x6b3d1e,
+    white: 0xffffff, dark: 0x2b1d14, stone: 0x8c6a4a, usedBlock: 0x6b4a33,
+    blockQ: 0xc27a3a, void: 0x2a5a9a, flag: 0x2fbf4a
+  };
+  const matCache = {};
+  const mat = (color) => matCache[color] || (matCache[color] = new THREE.MeshPhongMaterial({ color, flatShading: true, shininess: 10 }));
+  const toMat = (m) => (typeof m === 'number' ? mat(m) : m);
+
+  // Shadow-casting mesh; m is a hex colour, a material, or an array of materials
+  function add(geo, m, x, y, z, parent = scene) {
+    const mesh = new THREE.Mesh(geo, toMat(m));
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    parent.add(mesh);
+    return mesh;
+  }
+  const box = (w, h, d, m, x, y, z, parent) => add(new THREE.BoxGeometry(w, h, d), m, x, y, z, parent);
+
+  // 64px canvas textures for the "?" block and the brick block
+  function canvasTexture(draw) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    draw(c.getContext('2d'), 64);
+    const t = new THREE.CanvasTexture(c);
+    t.magFilter = THREE.NearestFilter;
+    return t;
+  }
+  const qTex = canvasTexture((g, s) => {
+    g.fillStyle = '#e0953a'; g.fillRect(0, 0, s, s);
+    g.strokeStyle = '#7a4a14'; g.lineWidth = 6; g.strokeRect(4, 4, s - 8, s - 8);
+    g.fillStyle = '#fff4cf'; g.font = 'bold 40px sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('?', s / 2, s / 2 + 2);
+  });
+  const brickTex = canvasTexture((g, s) => {
+    g.fillStyle = '#b8703a'; g.fillRect(0, 0, s, s);
+    g.strokeStyle = '#6b3c1c'; g.lineWidth = 4;
+    g.strokeRect(2, 2, s - 4, s - 4);
+    g.beginPath();
+    g.moveTo(0, s / 2); g.lineTo(s, s / 2);
+    g.moveTo(s / 2, 0); g.lineTo(s / 2, s / 2);
+    g.moveTo(s / 4, s / 2); g.lineTo(s / 4, s);
+    g.moveTo(3 * s / 4, s / 2); g.lineTo(3 * s / 4, s);
+    g.stroke();
+  });
+  const qFace = new THREE.MeshPhongMaterial({ map: qTex, flatShading: true });
+  const brickFace = new THREE.MeshPhongMaterial({ map: brickTex, flatShading: true });
+
+  // Seeded PRNG (Park-Miller): the procedural world is identical on every run
+  let seed = 1337;
+  const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const range = (a, b) => a + (b - a) * rand();
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  // ---------- Level layout (1 unit = 1 tile, ground top at y = 0) ----------
+  const GROUND = [[-10, 58], [61, 104], [107, 150], [153, 186], [189, 214]];   // gaps between segments are pits
+  const PIPES = [[27, 2], [46, 3], [78, 2], [92, 4], [120, 2], [128, 3], [176, 3]];  // [x, height]
+  const ROWS = [                                                             // [x, y, pattern]: B = brick, Q = question block
+    [16, 3, 'BQBQB'], [64, 3, 'BBBB'], [74, 5, 'QBQ'], [97, 4, 'QBB'],
+    [117, 3, 'BQBQ'], [138, 4, 'BBQBB'], [162, 3, 'BBQBB']
+  ];
+  const COIN_LINES = [                                                       // [x, count, y], one tile apart
+    [16, 3, 4.9], [20, 5, 1.2], [44, 4, 3.8], [56, 5, 3.2], [66, 4, 4.7], [78, 3, 4.0],
+    [100, 5, 3.4], [121, 3, 4.0], [146, 4, 1.4], [150, 5, 3.4], [182, 4, 3.4]
+  ];
+  const GOOMBA_X = [24, 36, 50, 70, 84, 100, 112, 124, 140, 166, 180];
+  const STAIRS_X = 189, FLAG_X = 199, LEVEL_END = 214;
+
+  // Solid AABBs for collision (blocks also link back to their block object)
+  const solids = [];
+  const addSolid = (x0, x1, y0, y1) => {
+    const s = { x0, x1, y0, y1, enabled: true, block: null };
+    solids.push(s);
+    return s;
+  };
+  const solidAt = (px, py) => solids.some((s) => s.enabled && px > s.x0 && px < s.x1 && py > s.y0 && py < s.y1);
+
+  // Ground: grass cap over dirt, with pits in between
+  for (const [x0, x1] of GROUND) {
+    const w = x1 - x0, cx = (x0 + x1) / 2;
+    box(w, 0.5, 6, C.grass, cx, -0.25, 0);
+    box(w, 3.5, 6, C.dirt, cx, -2.25, 0);
+    addSolid(x0, x1, -4, 0);
+  }
+  box(260, 0.2, 40, C.void, 100, -12, -10);   // abyss at the bottom of the pits
+
+  // Warp pipes
+  for (const [px, h] of PIPES) {
+    box(2, h - 0.6, 1.6, C.pipe, px + 1, (h - 0.6) / 2, 0);
+    box(2.4, 0.6, 1.9, C.pipeRim, px + 1, h - 0.3, 0);
+    addSolid(px, px + 2, 0, h - 0.6);
+    addSolid(px - 0.2, px + 2.2, h - 0.6, h);
+  }
+
+  // Question blocks contain coins or a Super Mushroom.
+  const blocks = [];
+  const qSide = mat(C.blockQ);
+  function makeBlock(x, y, isQ) {
+    const faces = isQ ? [qSide, qSide, qSide, qSide, qFace, qFace] : Array(6).fill(brickFace);
+    const mesh = add(new THREE.BoxGeometry(1, 1, 1), faces, x + 0.5, y + 0.5, 0);
+    const solid = addSolid(x, x + 1, y, y + 1);
+    const b = { mesh, solid, broken: false, x, y, isQ, mushroom: isQ && [17, 74, 118, 164].includes(x), used: false, bump: 0, faces, usedFaces: Array(6).fill(mat(C.usedBlock)) };
+    solid.block = b;
+    blocks.push(b);
+  }
+  for (const [bx, by, pattern] of ROWS) [...pattern].forEach((ch, i) => makeBlock(bx + i, by, ch === 'Q'));
+
+  // Staircase before the flag: column i is i + 1 tiles tall
+  for (let i = 0; i < 8; i++) {
+    box(1, i + 1, 1, C.stone, STAIRS_X + i + 0.5, (i + 1) / 2, 0);
+    addSolid(STAIRS_X + i, STAIRS_X + i + 1, 0, i + 1);
+  }
+
+  // Flagpole (touch it to clear the level) and a small castle
+  box(0.14, 9, 0.14, C.white, FLAG_X, 4.5, 0);
+  add(new THREE.SphereGeometry(0.22, 8, 6), C.coin, FLAG_X, 9.1, 0);
+  const flagGeo = new THREE.PlaneGeometry(1.4, 1);
+  flagGeo.translate(0.7, 0, 0);   // hang the flag from the pole
+  const flagMesh = add(flagGeo, new THREE.MeshPhongMaterial({ color: C.flag, side: THREE.DoubleSide, flatShading: true }), FLAG_X + 0.07, 8.2, 0.02);
+  box(5, 3.5, 2, C.stone, 209.5, 1.75, 0);
+  addSolid(207, 212, 0, 3.5);
+
+  // Coins: spinning gold discs, collected on contact
+  const coinGeo = new THREE.CylinderGeometry(0.26, 0.26, 0.08, 12);
+  coinGeo.rotateX(Math.PI / 2);   // disc faces the camera
+  const coinMat = new THREE.MeshPhongMaterial({ color: C.coin, emissive: 0x7a5200, shininess: 80, flatShading: true });
+  const coins = [];
+  function spawnCoin(x, y) {
+    const mesh = new THREE.Mesh(coinGeo, coinMat);
+    mesh.position.set(x, y, 0);
+    scene.add(mesh);
+    coins.push({ mesh, x, y, phase: rand() * 6, taken: false });
+  }
+  for (const [x0, n, y] of COIN_LINES) for (let i = 0; i < n; i++) spawnCoin(x0 + i, y);
+
+  // Goombas: mushroom enemies that patrol and turn around at walls and ledges
+  const goombas = [];
+  function makeGoomba(x) {
+    const mesh = new THREE.Group();
+    add(new THREE.SphereGeometry(0.42, 8, 5, 0, Math.PI * 2, 0, Math.PI / 2), C.mushroomCap, 0, 0.42, 0, mesh);
+    add(new THREE.CylinderGeometry(0.22, 0.3, 0.48, 8), C.mushroomStem, 0, 0.24, 0, mesh);
+    for (const sx of [-0.12, 0.12]) {
+      add(new THREE.SphereGeometry(0.1, 6, 4), C.white, sx, 0.26, 0.24, mesh);
+      add(new THREE.SphereGeometry(0.05, 5, 4), C.dark, sx, 0.25, 0.32, mesh);
+    }
+    for (const sx of [-0.17, 0.17]) box(0.2, 0.12, 0.28, C.dark, sx, 0.06, 0.04, mesh);
+    mesh.position.set(x, 0, 0);
+    scene.add(mesh);
+    goombas.push({ mesh, x, spawnX: x, dir: -1, speed: 2.2, alive: true, timer: 0 });
+  }
+  GOOMBA_X.forEach((x) => makeGoomba(x));
+
+  // Super Mushrooms share the level's faceted geometry and warm palette.
+  const mushrooms = [];
+  function spawnMushroom(x, y, emerging = false) {
+    const mesh = new THREE.Group();
+    add(new THREE.CylinderGeometry(0.22, 0.27, 0.44, 8), C.mushroomStem, 0, 0.22, 0, mesh);
+    add(new THREE.SphereGeometry(0.46, 8, 5, 0, Math.PI * 2, 0, Math.PI / 2), C.red, 0, 0.38, 0, mesh);
+    for (const [sx, sy, sz] of [[0, 0.74, 0.12], [-0.29, 0.56, 0.24], [0.29, 0.56, 0.24]]) {
+      add(new THREE.SphereGeometry(0.12, 6, 4), C.white, sx, sy, sz, mesh);
+    }
+    for (const sx of [-0.08, 0.08]) box(0.04, 0.1, 0.04, C.dark, sx, 0.23, 0.24, mesh);
+    mesh.position.set(x, y - (emerging ? 0.8 : 0), 0);
+    scene.add(mesh);
+    mushrooms.push({ mesh, x, y, vy: 0, dir: 1, emerge: emerging ? 0.65 : 0 });
+  }
+
+  // Turtles retreat into shells when stomped; idle shells can be kicked.
+  const turtles = [];
+  function makeTurtle(x) {
+    const mesh = new THREE.Group();
+    const body = new THREE.Group();
+    mesh.add(body);
+    const shell = add(new THREE.SphereGeometry(0.46, 8, 6), C.pipeRim, 0, 0.48, -0.06, mesh);
+    shell.scale.set(1, 0.9, 0.8);
+    const rim = add(new THREE.CylinderGeometry(0.46, 0.46, 0.12, 8), C.mushroomStem, 0, 0.29, -0.06, mesh);
+    rim.scale.z = 0.8;
+    box(0.3, 0.58, 0.28, C.coin, 0, 0.55, 0.25, body);
+    add(new THREE.SphereGeometry(0.25, 8, 6), C.coin, 0, 1.02, 0.24, body);
+    add(new THREE.SphereGeometry(0.18, 7, 5), C.coin, 0, 0.96, 0.44, body);
+    for (const sx of [-0.1, 0.1]) {
+      add(new THREE.SphereGeometry(0.08, 6, 4), C.white, sx, 1.1, 0.41, body);
+      add(new THREE.SphereGeometry(0.035, 5, 4), C.dark, sx, 1.1, 0.48, body);
+    }
+    const feet = [-0.22, 0.22].map(sx => box(0.24, 0.18, 0.36, C.brown, sx, 0.09, 0.12, body));
+    mesh.position.set(x, 0, 0);
+    scene.add(mesh);
+    turtles.push({ mesh, body, feet, x, spawnX: x, dir: -1, state: 'walk', wake: 0, grace: 0 });
+  }
+  [40, 73, 114, 145, 170].forEach(makeTurtle);
+
+  // ---------- Procedural decor: hills, bushes and clouds ----------
+  const inGround = (x) => GROUND.some(([a, b]) => x > a + 1 && x < b - 1);
+  const nearPipe = (x) => PIPES.some(([px]) => Math.abs(x - px - 1) < 2.5);
+  const cloudMat = new THREE.MeshPhongMaterial({ color: C.cloud, emissive: 0x3a4a5a, flatShading: true });
+  const clouds = [];
+  function makeCloud(x, y, z) {
+    const g = new THREE.Group();
+    const n = 3 + Math.floor(rand() * 3);
+    for (let i = 0; i < n; i++) {
+      const r = range(1.1, 2.1);
+      add(new THREE.SphereGeometry(r, 7, 5), cloudMat, (i - (n - 1) / 2) * 1.9, i % 2 ? r * 0.25 : 0, 0, g);
+    }
+    g.position.set(x, y, z);
+    scene.add(g);
+    clouds.push({ g, speed: range(0.3, 0.8) });
+  }
+  function makeHill(x, z, r, h, color) {
+    add(new THREE.SphereGeometry(r, 7, 5), color, x, 0, z).scale.y = h;
+  }
+  function makeBush(x) {
+    const s = range(0.7, 1.1);
+    const g = new THREE.Group();
+    g.position.set(x, 0, -1.5);   // on the grass, just behind the play lane
+    add(new THREE.SphereGeometry(0.6 * s, 6, 5), C.bush, -0.5 * s, 0.35 * s, 0, g);
+    add(new THREE.SphereGeometry(0.75 * s, 6, 5), C.bush, 0, 0.5 * s, 0, g);
+    add(new THREE.SphereGeometry(0.6 * s, 6, 5), C.bush, 0.5 * s, 0.35 * s, 0, g);
+    scene.add(g);
+  }
+  for (let i = 0; i < 14; i++) makeCloud(range(-20, 230), range(13, 20), range(-40, -28));
+  for (let i = 0; i < 22; i++) makeHill(range(-20, 230), range(-32, -20), range(4, 9), range(0.6, 1), rand() < 0.5 ? C.hill : C.hillDark);
+  for (let i = 0; i < 60; i++) {
+    const x = range(-8, 220);
+    if (inGround(x) && !nearPipe(x)) makeBush(x);
+  }
+
+  // ---------- Player: low-poly plumber built from basic shapes ----------
+  const player = new THREE.Group();
+  const legL = new THREE.Group(), legR = new THREE.Group();   // hip pivots
+  const armL = new THREE.Group(), armR = new THREE.Group();   // shoulder pivots
+  const head = new THREE.Group();
+  legL.position.set(-0.17, 0.7, 0); legR.position.set(0.17, 0.7, 0);
+  armL.position.set(-0.4, 1.2, 0); armR.position.set(0.4, 1.2, 0);
+  head.position.set(0, 1.38, 0);
+  [legL, legR, armL, armR, head].forEach((part) => player.add(part));
+  scene.add(player);
+
+  for (const leg of [legL, legR]) {                         // blue overalls, brown shoes
+    box(0.26, 0.5, 0.28, C.blue, 0, -0.25, 0, leg);
+    box(0.32, 0.2, 0.42, C.brown, 0, -0.6, 0.05, leg);
+  }
+  box(0.6, 0.36, 0.42, C.blue, 0, 0.88, 0, player);        // overalls
+  box(0.64, 0.26, 0.46, C.red, 0, 1.2, 0, player);         // red shirt
+  for (const sx of [-0.16, 0.16]) add(new THREE.SphereGeometry(0.05, 6, 4), C.coin, sx, 1.0, 0.23, player); // buttons
+  for (const arm of [armL, armR]) {                         // red sleeves, white gloves
+    box(0.22, 0.44, 0.24, C.red, 0, -0.22, 0, arm);
+    add(new THREE.SphereGeometry(0.14, 7, 5), C.white, 0, -0.5, 0, arm);
+  }
+  // Head: skin face, nose, mustache, sideburns, red cap with emblem
+  add(new THREE.SphereGeometry(0.28, 10, 8), C.skin, 0, 0, 0, head);
+  add(new THREE.SphereGeometry(0.1, 7, 5), C.skin, 0, -0.03, 0.28, head);
+  box(0.26, 0.08, 0.1, C.brown, 0, -0.11, 0.25, head);
+  for (const sx of [-0.1, 0.1]) box(0.06, 0.12, 0.05, C.dark, sx, 0.06, 0.26, head);
+  for (const sx of [-0.26, 0.26]) box(0.06, 0.16, 0.12, C.brown, sx, -0.02, 0, head);
+  add(new THREE.SphereGeometry(0.3, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), C.red, 0, 0.04, 0, head);
+  box(0.36, 0.06, 0.26, C.red, 0, 0.05, 0.2, head);
+  add(new THREE.SphereGeometry(0.07, 6, 4), C.white, 0, 0.18, 0.26, head);
+
+  // ---------- Game state, HUD & input ----------
+  const HW = 0.3, SMALL_H = 1.7, BIG_H = 2.6, EPS = 1e-3;                   // player half-width and height
+  const GRAV = 42, JUMP_V = 20, MAX_FALL = 28, MAX_RUN = 9, RUN_ACC = 46, FRICTION = 36;
+  const TIME_START = 400;
+  const P = { x: 2, y: 0, vx: 0, vy: 0, grounded: false, coyote: 0, jumpBuf: 0, facing: 1, big: false, growthPending: false, invincible: 0, state: 'play', bounce: false };
+  const playerHeight = () => P.big ? BIG_H : SMALL_H;
+  const game = { score: 0, coins: 0, time: TIME_START, won: false, over: false };
+  const $score = document.getElementById('score');
+  const $coins = document.getElementById('coins');
+  const $time = document.getElementById('time');
+  const $msg = document.getElementById('msg');
+
+  function drawHud() {
+    $score.textContent = String(game.score).padStart(6, '0');
+    $coins.textContent = 'x' + String(game.coins).padStart(2, '0');
+    $time.textContent = String(Math.ceil(game.time));
+  }
+  function showMsg(title, sub = '') {
+    $msg.innerHTML = `<b>${title}</b>${sub ? `<small>${sub}</small>` : ''}`;
+    $msg.style.display = title ? 'flex' : 'none';
+  }
+
+  const keys = {};
+  const jumpHeld = () => !!(keys.Space || keys.ArrowUp || keys.KeyW);
+  window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+    if (!e.repeat && (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW')) P.jumpBuf = 0.12;
+    if ((e.code === 'KeyR' || e.code === 'Enter') && (game.over || game.won)) restart();
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+  // ---------- Game flow ----------
+  function kill(title) {
+    if (P.state !== 'play') return;
+    P.state = 'dead'; P.vx = 0; P.vy = 13;                 // little hop, then fall
+    game.over = true;
+    showMsg(title, 'Press R to play again');
+  }
+  function win() {
+    P.state = 'won'; game.won = true;
+    const bonus = Math.ceil(game.time) * 50;
+    game.score += bonus;
+    showMsg('COURSE CLEAR!', `Time bonus +${bonus} · Press R to play again`);
+  }
+  function restart() {
+    Object.assign(P, { x: 2, y: 0, vx: 0, vy: 0, grounded: false, coyote: 0, jumpBuf: 0, facing: 1, big: false, growthPending: false, invincible: 0, state: 'play', bounce: false });
+    Object.assign(game, { score: 0, coins: 0, time: TIME_START, won: false, over: false });
+    for (const b of blocks) { b.broken = false; b.solid.enabled = true; b.mesh.visible = true; b.used = false; b.bump = 0; b.mesh.material = b.faces; b.mesh.position.y = b.y + 0.5; }
+    for (const c of coins) { c.taken = false; c.mesh.visible = true; }
+    for (const g of goombas) { g.x = g.spawnX; g.dir = -1; g.alive = true; g.timer = 0; g.mesh.visible = true; g.mesh.scale.y = 1; }
+    for (const e of effects) scene.remove(e.mesh);
+    effects.length = 0;
+    for (const m of mushrooms) scene.remove(m.mesh);
+    mushrooms.length = 0;
+    for (const t of turtles) {
+      Object.assign(t, { x: t.spawnX, dir: -1, state: 'walk', wake: 0, grace: 0 });
+      t.mesh.position.set(t.x, 0, 0); t.mesh.visible = true; t.body.visible = true;
+    }
+    player.scale.set(1, 1, 1); player.visible = true;
+    flagMesh.position.y = 8.2;
+    showMsg('');
+    drawHud();
+  }
+
+  function tryGrow() {
+    if (!P.growthPending || P.big) return;
+    const blocked = solids.some(s => s.enabled && P.x + HW > s.x0 && P.x - HW < s.x1 &&
+      P.y < s.y1 - EPS && P.y + BIG_H > s.y0 + EPS);
+    if (!blocked) { P.big = true; P.growthPending = false; }
+  }
+  function hurtPlayer() {
+    if (P.state !== 'play' || P.invincible > 0) return;
+    if (P.big) {
+      P.big = false; P.growthPending = false; P.invincible = 1.8;
+    } else kill('GAME OVER');
+  }
+
+  // ---------- Player physics: AABB against solids, resolved per axis ----------
+  function stepPlayer(dt) {
+    if (P.state !== 'play') return;
+    P.invincible = Math.max(0, P.invincible - dt);
+    tryGrow();
+    const HH = playerHeight();
+    const playing = true;
+    const right = keys.ArrowRight || keys.KeyD, left = keys.ArrowLeft || keys.KeyA;
+    const dir = playing ? (right ? 1 : 0) - (left ? 1 : 0) : 0;
+    if (dir) P.facing = dir;
+
+    // Horizontal: ease toward target speed, friction when there is no input
+    const accel = (dir ? RUN_ACC : FRICTION) * dt;
+    P.vx += Math.max(-accel, Math.min(accel, dir * MAX_RUN - P.vx));
+
+    // Jump: coyote time and input buffer; releasing jump early cuts it short
+    P.coyote = P.grounded ? 0.1 : Math.max(0, P.coyote - dt);
+    P.jumpBuf = Math.max(0, P.jumpBuf - dt);
+    if (playing && P.jumpBuf > 0 && P.coyote > 0) {
+      P.vy = JUMP_V; P.jumpBuf = 0; P.coyote = 0; P.grounded = false;
+    }
+    // Releasing jump while rising cuts the jump short; stomp bounces keep their full height
+    const cut = P.vy > 0 && !jumpHeld() && !P.bounce;
+    P.vy = Math.max(-MAX_FALL, P.vy - (cut ? GRAV * 2.5 : GRAV) * dt);
+    if (P.vy <= 0) P.bounce = false;
+
+    // Horizontal collision
+    P.x += P.vx * dt;
+    for (const s of solids) {
+      if (!s.enabled) continue;
+      if (P.y + HH <= s.y0 + EPS || P.y >= s.y1 - EPS) continue;   // no vertical overlap
+      if (P.x + HW <= s.x0 || P.x - HW >= s.x1) continue;          // no horizontal overlap
+      if (P.vx > 0) P.x = s.x0 - HW;
+      else if (P.vx < 0) P.x = s.x1 + HW;
+      P.vx = 0;
+    }
+
+    // Vertical collision: land on tops, bump undersides (which hits question blocks)
+    const prevY = P.y;
+    P.y += P.vy * dt;
+    P.grounded = false;
+    for (const s of solids) {
+      if (!s.enabled) continue;
+      if (P.x + HW <= s.x0 || P.x - HW >= s.x1) continue;
+      if (P.vy <= 0 && prevY >= s.y1 - EPS && P.y < s.y1) {
+        P.y = s.y1; P.vy = 0; P.grounded = true;
+      } else if (P.vy > 0 && prevY + HH <= s.y0 + EPS && P.y + HH > s.y0) {
+        P.y = s.y0 - HH; P.vy = 0;
+        if (s.block) hitBlock(s.block);
+      }
+    }
+    if (P.y < -8) kill('GAME OVER');                  // fell into a pit
+    if (P.state !== 'play') return;
+
+    // Goombas: stomp from above, otherwise the player gets hurt
+    for (const g of goombas) {
+      if (!g.alive || Math.abs(P.x - g.x) > HW + 0.42 || P.y >= 0.85 || P.y + HH <= 0) continue;
+      if (P.vy < 0 && prevY > 0.5) {
+        g.alive = false; g.timer = 0.45; g.mesh.scale.y = 0.3;
+        P.vy = 14; P.bounce = true;
+        game.score += 100;
+      } else {
+        hurtPlayer();
+      }
+    }
+
+    // Turtles: stomp walking enemies, stop sliding shells, or kick idle shells.
+    for (const t of turtles) {
+      const height = t.state === 'walk' ? 1.26 : 0.9;
+      if (t.state === 'dead' || t.grace > 0 || Math.abs(P.x - t.x) > HW + 0.44 ||
+          P.y >= height || P.y + HH <= 0) continue;
+      if (P.vy < 0 && prevY >= height - 0.25) {
+        t.state = 'shell'; t.body.visible = false; t.wake = 7; t.grace = 0.2;
+        P.y = height; P.vy = jumpHeld() ? 16 : 11; P.grounded = false; P.bounce = true;
+        game.score += 100;
+      } else if (t.state === 'shell') {
+        t.state = 'slide'; t.dir = P.x < t.x ? 1 : -1; t.grace = 0.2;
+        game.score += 100;
+      } else hurtPlayer();
+    }
+    if (P.state !== 'play') return;
+
+    for (let i = mushrooms.length - 1; i >= 0; i--) {
+      const m = mushrooms[i];
+      if (m.emerge > 0 || Math.abs(P.x - m.x) > HW + 0.42 ||
+          P.y >= m.y + 0.84 || P.y + HH <= m.y) continue;
+      scene.remove(m.mesh); mushrooms.splice(i, 1); game.score += 1000;
+      if (!P.big) { P.growthPending = true; tryGrow(); }
+    }
+
+    // Coins and the flagpole
+    for (const c of coins) {
+      if (c.taken || Math.abs(P.x - c.x) > HW + 0.26 || P.y >= c.y + 0.3 || P.y + HH <= c.y - 0.3) continue;
+      c.taken = true; c.mesh.visible = false;
+      game.coins++; game.score += 200;
+    }
+    if (P.x + HW >= FLAG_X) win();
+  }
+
+  // ---------- Enemies, blocks, effects, player pose & camera ----------
+  let wt = 0;                 // world time: coin spin, effects
+  let runT = 0;               // run-cycle phase
+  let camX = 2, camY = 3.2;   // smoothed camera focus
+  const effects = [];         // coin pops and brick fragments
+  const fragmentGeo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+
+  function hitBlock(b) {
+    if (b.broken) return;
+    if (!b.isQ && P.big) {
+      b.broken = true; b.solid.enabled = false; b.mesh.visible = false; b.bump = 0;
+      game.score += 50;
+      for (const dx of [-1, 1]) for (const dy of [-1, 1]) {
+        const mesh = add(fragmentGeo, brickFace, b.x + 0.5 + dx * 0.22, b.y + 0.5 + dy * 0.22, 0);
+        effects.push({ mesh, vx: dx * 3, vy: dy > 0 ? 9 : 5, t: 0.8, debris: true });
+      }
+      return;
+    }
+    b.bump = 0.25;
+    if (b.isQ && !b.used) {
+      b.used = true;
+      b.mesh.material = b.usedFaces;
+      if (b.mushroom) {
+        spawnMushroom(b.x + 0.5, b.y + 1, true);
+        return;
+      }
+      const mesh = new THREE.Mesh(coinGeo, coinMat);
+      mesh.position.set(b.x + 0.5, b.y + 1.6, 0);
+      scene.add(mesh);
+      effects.push({ mesh, vy: 9, t: 0.5 });
+      game.coins++; game.score += 200;
+    }
+  }
+  function updateBlocks(dt) {
+    for (const b of blocks) {
+      if (b.bump <= 0) continue;
+      b.bump = Math.max(0, b.bump - dt);
+      b.mesh.position.y = b.y + 0.5 + 0.25 * Math.sin((b.bump / 0.25) * Math.PI);
+    }
+  }
+  function updateEffects(dt) {
+    for (let i = effects.length - 1; i >= 0; i--) {
+      const e = effects[i];
+      e.t -= dt; e.vy -= 30 * dt;
+      e.mesh.position.y += e.vy * dt;
+      if (e.debris) {
+        e.mesh.position.x += e.vx * dt;
+        e.mesh.rotation.x += dt * 6;
+        e.mesh.rotation.z += dt * e.vx;
+      } else e.mesh.scale.x = Math.abs(Math.cos(e.t * 14)) + 0.1;
+      if (e.t <= 0) { scene.remove(e.mesh); effects.splice(i, 1); }
+    }
+  }
+  function updateGoombas(dt) {
+    for (const g of goombas) {
+      if (!g.alive) {                                       // squashed: hide after a moment
+        g.timer -= dt;
+        if (g.timer <= 0) g.mesh.visible = false;
+        continue;
+      }
+      const nx = g.x + g.dir * g.speed * dt;
+      const ahead = nx + g.dir * 0.45;
+      // Turn around at walls and at ledges (no ground under the next step)
+      if (solidAt(ahead, 0.3) || !solidAt(ahead + g.dir * 0.2, -0.3)) g.dir = -g.dir;
+      else g.x = nx;
+      g.mesh.position.x = g.x;
+    }
+  }
+
+  function updateMushrooms(dt) {
+    for (let i = mushrooms.length - 1; i >= 0; i--) {
+      const m = mushrooms[i];
+      if (m.emerge > 0) {
+        m.emerge = Math.max(0, m.emerge - dt);
+        m.mesh.position.y = m.y - 0.8 * m.emerge / 0.65;
+        continue;
+      }
+      const nx = m.x + m.dir * 2.4 * dt;
+      const wall = solids.some(s => s.enabled && nx + 0.4 > s.x0 && nx - 0.4 < s.x1 &&
+        m.y + 0.7 > s.y0 + EPS && m.y < s.y1 - EPS);
+      if (wall) m.dir *= -1; else m.x = nx;
+      const prevY = m.y;
+      m.vy = Math.max(-MAX_FALL, m.vy - GRAV * dt);
+      m.y += m.vy * dt;
+      for (const s of solids) {
+      if (!s.enabled) continue;
+        if (m.x + 0.35 > s.x0 && m.x - 0.35 < s.x1 && prevY >= s.y1 - EPS && m.y < s.y1) {
+          m.y = s.y1; m.vy = 0;
+        }
+      }
+      m.mesh.position.set(m.x, m.y, 0);
+      if (m.y < -8) { scene.remove(m.mesh); mushrooms.splice(i, 1); }
+    }
+  }
+
+  function updateTurtles(dt) {
+    for (const t of turtles) {
+      if (t.state === 'dead') continue;
+      t.grace = Math.max(0, t.grace - dt);
+      if (t.state === 'shell') {
+        t.wake -= dt;
+        if (t.wake <= 0) { t.state = 'walk'; t.body.visible = true; t.grace = 0.3; }
+      } else {
+        const nx = t.x + t.dir * (t.state === 'slide' ? 13 : 1.7) * dt;
+        const ahead = nx + t.dir * 0.47;
+        if (solidAt(ahead, 0.35) || !solidAt(ahead + t.dir * 0.15, -0.3)) t.dir *= -1;
+        else t.x = nx;
+      }
+      t.mesh.position.x = t.x;
+      t.mesh.rotation.y = t.dir * 0.5;
+      t.feet.forEach((foot, i) => { foot.position.y = 0.09 + Math.max(0, Math.sin(wt * 10 + i * Math.PI)) * 0.08; });
+      if (t.state !== 'slide') continue;
+      for (const g of goombas) {
+        if (!g.alive || Math.abs(g.x - t.x) > 0.8) continue;
+        g.alive = false; g.timer = 0; g.mesh.visible = false; game.score += 100;
+      }
+      for (const other of turtles) {
+        if (other === t || other.state === 'dead' || Math.abs(other.x - t.x) > 0.85) continue;
+        other.state = 'dead'; other.mesh.visible = false; game.score += 200;
+      }
+    }
+  }
+
+  function updatePlayer(dt) {
+    player.position.set(P.x, P.y, 0);
+    player.scale.set(P.big ? 1.15 : 1, P.big ? BIG_H / SMALL_H : 1, P.big ? 1.15 : 1);
+    player.visible = P.state !== 'play' || P.invincible <= 0 || Math.floor(P.invincible * 12) % 2 === 0;
+    player.rotation.y = lerp(player.rotation.y, P.facing * 0.6, 1 - Math.exp(-dt * 12));   // turn toward movement
+    const k = 1 - Math.exp(-dt * 14);
+    const speed = Math.abs(P.vx);
+    let legSwing = 0, armSwing = 0, armRaise = 0;           // pose targets
+    if (!P.grounded) {                                      // jumping: arms up, legs apart
+      legSwing = -0.5; armRaise = 1;
+    } else if (speed > 0.5) {                               // running: arms and legs swing in opposition
+      runT += dt * (6 + speed * 1.2);
+      legSwing = Math.sin(runT) * 0.8;
+      armSwing = -legSwing * 0.8;
+    }
+    legL.rotation.x = lerp(legL.rotation.x, legSwing, k);
+    legR.rotation.x = lerp(legR.rotation.x, -legSwing, k);
+    armL.rotation.x = lerp(armL.rotation.x, armSwing, k);
+    armR.rotation.x = lerp(armR.rotation.x, -armSwing, k);
+    armL.rotation.z = lerp(armL.rotation.z, -2.6 * armRaise, k);
+    armR.rotation.z = lerp(armR.rotation.z, 2.6 * armRaise, k);
+  }
+
+  function updateCamera(dt) {
+    const halfT = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+    const dist = Math.max(18, 12 / (halfT * camera.aspect));       // pull back on narrow screens
+    const halfW = dist * halfT * camera.aspect;
+    const tx = THREE.MathUtils.clamp(P.x + 2.5, halfW - 14, LEVEL_END - halfW + 4);
+    const ty = Math.max(3.2, P.y + 2.4);
+    const k = 1 - Math.exp(-dt * 6);
+    camX = lerp(camX, tx, k);
+    camY = lerp(camY, ty, k);
+    camera.position.set(camX, camY, dist);
+    camera.lookAt(camX, camY - 1.6, 0);
+    // Keep the shadow frustum centred on the action
+    sun.position.set(camX + 20, 40, 15);
+    sun.target.position.set(camX, 0, 0);
+  }
+
+  // ---------- Resize ----------
+  function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+  window.addEventListener('resize', onResize);
+
+  // ---------- Loop ----------
+  const clock = new THREE.Clock();
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    update(dt);
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  function update(dt) {
+    wt += dt;
+    if (P.state !== 'dead') {
+      const n = Math.max(1, Math.ceil(dt / (1 / 120)));    // fixed substeps keep collisions stable
+      for (let i = 0; i < n && P.state !== 'dead'; i++) stepPlayer(dt / n);
+    } else {
+      P.vy = Math.max(-MAX_FALL, P.vy - GRAV * dt);
+      P.y += P.vy * dt;
+    }
+    if (P.state === 'play') {
+      game.time = Math.max(0, game.time - dt);
+      if (game.time === 0) kill('TIME UP');
+    }
+    if (P.state === 'play') {
+      updateGoombas(dt);
+      updateTurtles(dt);
+      updateMushrooms(dt);
+    }
+    updateBlocks(dt);
+    updateEffects(dt);
+    for (const c of coins) {
+      if (c.taken) continue;
+      c.mesh.scale.x = Math.abs(Math.cos(wt * 3 + c.phase)) + 0.1;
+      c.mesh.position.y = c.y + Math.sin(wt * 2 + c.phase) * 0.08;
+    }
+    for (const c of clouds) {
+      c.g.position.x += c.speed * dt;
+      if (c.g.position.x > LEVEL_END + 30) c.g.position.x = -30;
+    }
+    if (game.won && flagMesh.position.y > 1.6) flagMesh.position.y -= dt * 3;   // flag slides down
+    updatePlayer(dt);
+    updateCamera(dt);
+    drawHud();
+  }
+  restart();
+  frame();
+})();
+</script>
+</body>
+</html>

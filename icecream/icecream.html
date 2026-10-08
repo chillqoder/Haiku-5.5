@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Low-Poly Ice Cream Sundae</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #bfe9df;
+    }
+    canvas { display: block; }
+    #hint {
+      position: fixed;
+      left: 16px;
+      bottom: 12px;
+      font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      color: rgba(60, 30, 40, 0.6);
+      pointer-events: none;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hint">Drag to rotate · Scroll to zoom</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+    // ---------- Рендерер, сцена, камера ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    document.body.appendChild(renderer.domElement);
+
+    const BG = 0xbfe9df; // мятный фон
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BG);
+    scene.fog = new THREE.Fog(BG, 16, 34);
+    // Окружение для глянцевых отражений (глазурь, керамика)
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+    const camera = new THREE.PerspectiveCamera(38, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(3.4, 4.6, 8.6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 2.2, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 4;
+    controls.maxDistance = 16;
+    controls.maxPolarAngle = Math.PI * 0.46; // камера не уходит под стол
+    controls.update();
+
+    // ---------- Освещение ----------
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xe8b6a0, 0.8));
+
+    const key = new THREE.DirectionalLight(0xfff3e0, 2.2); // основной свет с тенями
+    key.position.set(4, 9, 6);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    Object.assign(key.shadow.camera, { left: -5, right: 5, top: 5, bottom: -5, near: 0.5, far: 30 });
+    key.shadow.camera.updateProjectionMatrix();
+    key.shadow.bias = -0.0005;
+    key.shadow.normalBias = 0.02;
+    scene.add(key);
+
+    const fill = new THREE.DirectionalLight(0xcfe3ff, 0.6); // холодный заполняющий свет
+    fill.position.set(-6, 3, 4);
+    scene.add(fill);
+
+    const backLight = new THREE.PointLight(0xff9ecf, 22, 24, 2); // розовый контровой свет
+    backLight.position.set(-3, 5, -4);
+    scene.add(backLight);
+
+    // ---------- Стол и тарелка ----------
+    const table = new THREE.Mesh(
+      new THREE.CircleGeometry(14, 24),
+      new THREE.MeshStandardMaterial({ color: 0xf2c4a0, roughness: 0.85 })
+    );
+    table.rotation.x = -Math.PI / 2;
+    table.receiveShadow = true;
+    scene.add(table);
+
+    const PLATE_TOP = 0.14; // высота поверхности тарелки
+    const plateMat = new THREE.MeshStandardMaterial({ color: 0xfff8f0, roughness: 0.3, flatShading: true });
+    const plate = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 1.5, PLATE_TOP, 12), plateMat);
+    plate.position.y = PLATE_TOP / 2;
+    plate.castShadow = true;
+    plate.receiveShadow = true;
+    scene.add(plate);
+
+    const plateRim = new THREE.Mesh(new THREE.TorusGeometry(1.8, 0.05, 6, 12), plateMat);
+    plateRim.rotation.x = Math.PI / 2;
+    plateRim.position.y = PLATE_TOP;
+    plateRim.castShadow = true;
+    scene.add(plateRim);
+
+    // ---------- Десерт: вафельный рожок ----------
+    const sundae = new THREE.Group();
+    scene.add(sundae);
+
+    function makeWaffleTexture() {
+      const size = 256, cells = 4, cell = size / cells, inset = 12;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = size;
+      const g = canvas.getContext('2d');
+      g.fillStyle = '#8a4b22'; // «швы» вафли
+      g.fillRect(0, 0, size, size);
+      g.fillStyle = '#eab063'; // ячейки
+      for (let y = 0; y < cells; y++) {
+        for (let x = 0; x < cells; x++) {
+          g.fillRect(x * cell + inset, y * cell + inset, cell - inset * 2, cell - inset * 2);
+        }
+      }
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(4, 2);
+      return tex;
+    }
+
+    const CONE_R = 0.95, CONE_H = 2.4;
+    const waffleMat = new THREE.MeshStandardMaterial({
+      map: makeWaffleTexture(), roughness: 0.75, flatShading: true, side: THREE.DoubleSide,
+    });
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(CONE_R, CONE_H, 10, 1, true), waffleMat);
+    cone.rotation.x = Math.PI; // острие вниз, на тарелку
+    cone.position.y = PLATE_TOP + CONE_H / 2;
+    cone.castShadow = true;
+    cone.receiveShadow = true;
+    sundae.add(cone);
+
+    const CONE_TOP = PLATE_TOP + CONE_H; // край рожка
+    const coneRim = new THREE.Mesh(new THREE.TorusGeometry(CONE_R, 0.07, 6, 12), waffleMat);
+    coneRim.rotation.x = Math.PI / 2;
+    coneRim.position.y = CONE_TOP;
+    coneRim.castShadow = true;
+    sundae.add(coneRim);
+
+    // ---------- Шарик мороженого с завитком ----------
+    const SCOOP_R = 1.05;
+    const scoopGroup = new THREE.Group();
+    scoopGroup.position.y = CONE_TOP + 0.36; // центр шарика чуть выше края рожка
+    sundae.add(scoopGroup);
+
+    // Завиток: спиральные полосы двух оттенков розового, раскрашенные по вершинам
+    const scoopGeo = new THREE.IcosahedronGeometry(SCOOP_R, 2);
+    const scoopPos = scoopGeo.attributes.position;
+    const scoopCol = new Float32Array(scoopPos.count * 3);
+    const baseC = new THREE.Color(0xffc8dc);  // бледно-розовый крем
+    const swirlC = new THREE.Color(0xe85d8f); // малиновый завиток
+    for (let i = 0; i < scoopPos.count; i++) {
+      const x = scoopPos.getX(i), y = scoopPos.getY(i), z = scoopPos.getZ(i);
+      // две спиральные «руки»: фаза зависит от азимута и высоты точки
+      const wave = Math.sin(2 * Math.atan2(z, x) + 6 * Math.PI * (y / SCOOP_R));
+      const c = wave > 0 ? swirlC : baseC;
+      scoopCol.set([c.r, c.g, c.b], i * 3);
+    }
+    scoopGeo.setAttribute('color', new THREE.BufferAttribute(scoopCol, 3));
+    const creamMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.45, flatShading: true });
+    const scoop = new THREE.Mesh(scoopGeo, creamMat);
+    scoop.castShadow = true;
+    scoop.receiveShadow = true;
+    scoopGroup.add(scoop);
+
+    // ---------- Глазурь и стекающие капли ----------
+    const GLAZE_R = 1.1;
+    const EDGE = 1.25; // полярный угол края глазури (рад)
+    const glazeMat = new THREE.MeshPhysicalMaterial({
+      color: 0x4a2213, roughness: 0.2, clearcoat: 1, clearcoatRoughness: 0.12, flatShading: true,
+      envMapIntensity: 0.35, // мягче отражения окружения, блики остаются
+    });
+    const glaze = new THREE.Mesh(
+      new THREE.SphereGeometry(GLAZE_R, 12, 7, 0, Math.PI * 2, 0, EDGE),
+      glazeMat
+    );
+    glaze.castShadow = true;
+    scoopGroup.add(glaze);
+
+    // Точка на сфере глазури: theta — полярный угол от макушки, phi — азимут
+    const pointOn = (theta, phi, r, out) =>
+      out.set(r * Math.sin(theta) * Math.cos(phi), r * Math.cos(theta), r * Math.sin(theta) * Math.sin(phi));
+
+    const DRIP_COUNT = 14;
+    const dripGeo = new THREE.CylinderGeometry(0.05, 0.07, 1, 6); // единичная высота, центр в нуле
+    const bulbGeo = new THREE.IcosahedronGeometry(0.095, 1);
+    const drips = [];
+    for (let i = 0; i < DRIP_COUNT; i++) {
+      const body = new THREE.Mesh(dripGeo, glazeMat);
+      const bulb = new THREE.Mesh(bulbGeo, glazeMat);
+      scoopGroup.add(body, bulb);
+      const maxLen = THREE.MathUtils.randFloat(0.6, 1.2);
+      drips.push({
+        phi: (i / DRIP_COUNT) * Math.PI * 2 + THREE.MathUtils.randFloatSpread(0.25),
+        len: THREE.MathUtils.randFloat(0.05, maxLen), // текущая длина, ед.
+        maxLen,
+        speed: THREE.MathUtils.randFloat(0.05, 0.13), // медленное стекание, ед./с
+        state: 'grow',                                 // 'grow' — растёт, 'snap' — отрывается
+        body,
+        bulb,
+      });
+    }
+
+    // ---------- Вишенка ----------
+    const cherry = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(0.19, 1),
+      new THREE.MeshStandardMaterial({ color: 0xe63946, roughness: 0.25, flatShading: true })
+    );
+    cherry.position.set(0, GLAZE_R + 0.1, 0);
+    cherry.castShadow = true;
+    scoopGroup.add(cherry);
+
+    const stem = new THREE.Mesh(
+      new THREE.TubeGeometry(new THREE.CatmullRomCurve3([
+        new THREE.Vector3(0, GLAZE_R + 0.2, 0),
+        new THREE.Vector3(0.05, GLAZE_R + 0.4, 0),
+        new THREE.Vector3(0.18, GLAZE_R + 0.52, 0.02),
+      ]), 12, 0.02, 4, false),
+      new THREE.MeshStandardMaterial({ color: 0x3f8f3a, roughness: 0.6 })
+    );
+    stem.castShadow = true;
+    scoopGroup.add(stem);
+
+    // ---------- Частицы: капли глазури и искры ----------
+    class Particles {
+      constructor({ max, size, color, gravity, additive, floorY = null }) {
+        this.max = max;
+        this.gravity = gravity;
+        this.floorY = floorY; // высота, на которой частица «разбивается»
+        this.next = 0;
+        this.pos = new Float32Array(max * 3).fill(-1000); // неактивные частицы спрятаны
+        this.col = new Float32Array(max * 3);
+        this.vel = new Float32Array(max * 3);
+        this.life = new Float32Array(max);
+        this.maxLife = new Float32Array(max);
+        this.base = new THREE.Color(color);
+
+        this.geo = new THREE.BufferGeometry();
+        this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+        this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+        const mat = new THREE.PointsMaterial({
+          size,
+          vertexColors: true,
+          transparent: true,
+          depthWrite: false,
+          blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+        });
+        this.points = new THREE.Points(this.geo, mat);
+        this.points.frustumCulled = false;
+        scene.add(this.points);
+      }
+
+      // Новая частица занимает слот по кольцу: при переполнении старые перезаписываются
+      emit(x, y, z, vx, vy, vz, life) {
+        const i = this.next;
+        this.next = (this.next + 1) % this.max;
+        const k = i * 3;
+        this.pos.set([x, y, z], k);
+        this.vel.set([vx, vy, vz], k);
+        this.life[i] = this.maxLife[i] = life;
+      }
+
+      update(dt, onLand) {
+        for (let i = 0; i < this.max; i++) {
+          if (this.life[i] <= 0) continue;
+          const k = i * 3;
+          this.life[i] -= dt;
+          this.vel[k + 1] -= this.gravity * dt;
+          this.pos[k] += this.vel[k] * dt;
+          this.pos[k + 1] += this.vel[k + 1] * dt;
+          this.pos[k + 2] += this.vel[k + 2] * dt;
+
+          const landed = this.floorY !== null && this.pos[k + 1] <= this.floorY;
+          if (landed && onLand) onLand(this.pos[k], this.floorY, this.pos[k + 2]);
+          if (this.life[i] <= 0 || landed) {
+            this.life[i] = 0;
+            this.pos.fill(-1000, k, k + 3);
+            this.col.fill(0, k, k + 3);
+            continue;
+          }
+          const f = this.life[i] / this.maxLife[i]; // затухание цвета
+          this.col[k] = this.base.r * f;
+          this.col[k + 1] = this.base.g * f;
+          this.col[k + 2] = this.base.b * f;
+        }
+        this.geo.attributes.position.needsUpdate = true;
+        this.geo.attributes.color.needsUpdate = true;
+      }
+    }
+
+    // Solid chocolate drops flatten into glossy puddles on the plate.
+    const dropGeometry = new THREE.IcosahedronGeometry(0.085, 2);
+    const puddleGeometry = new THREE.SphereGeometry(1, 16, 8);
+    const fallingDrops = [];
+    const puddles = [];
+    let nextDrop = 0;
+    let nextPuddle = 0;
+
+    for (let i = 0; i < 40; i++) {
+      const mesh = new THREE.Mesh(dropGeometry, glazeMat);
+      mesh.visible = false;
+      mesh.castShadow = true;
+      scene.add(mesh);
+      fallingDrops.push({ mesh, velocity: new THREE.Vector3(), active: false });
+    }
+
+    for (let i = 0; i < 80; i++) {
+      const material = glazeMat.clone();
+      material.transparent = true;
+      const mesh = new THREE.Mesh(puddleGeometry, material);
+      mesh.visible = false;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      puddles.push({ mesh, age: 0, radius: 0, aspect: 1, active: false });
+    }
+
+    function spreadChocolate(x, z) {
+      // Keep the whole puddle inside the plate's twelve-sided rim.
+      const radius = THREE.MathUtils.randFloat(0.17, 0.26);
+      const maxDistance = 1.8 * Math.cos(Math.PI / 12) - radius * 1.2 - 0.06;
+      const distance = Math.hypot(x, z);
+      if (distance > maxDistance) {
+        x *= maxDistance / distance;
+        z *= maxDistance / distance;
+      }
+      const puddle = puddles[nextPuddle];
+      nextPuddle = (nextPuddle + 1) % puddles.length;
+      puddle.age = 0;
+      puddle.radius = radius;
+      puddle.aspect = THREE.MathUtils.randFloat(0.85, 1.15);
+      puddle.active = true;
+      puddle.mesh.visible = true;
+      puddle.mesh.material.opacity = 1;
+      puddle.mesh.position.set(x, PLATE_TOP + 0.008, z);
+      puddle.mesh.rotation.y = Math.random() * Math.PI * 2;
+      puddle.mesh.scale.set(0.075, 0.045, 0.075);
+    }
+
+    const drops = {
+      emit(x, y, z, vx, vy, vz) {
+        const drop = fallingDrops[nextDrop];
+        nextDrop = (nextDrop + 1) % fallingDrops.length;
+        drop.active = true;
+        drop.mesh.visible = true;
+        drop.mesh.position.set(x, y, z);
+        drop.mesh.scale.set(0.85, 1.3, 0.85);
+        drop.velocity.set(vx, vy, vz);
+      },
+      update(dt) {
+        for (const drop of fallingDrops) {
+          if (!drop.active) continue;
+          drop.velocity.y -= 7 * dt;
+          drop.mesh.position.addScaledVector(drop.velocity, dt);
+          drop.mesh.scale.y = 1.3 + Math.min(-drop.velocity.y * 0.08, 0.5);
+          if (drop.mesh.position.y <= PLATE_TOP + 0.085 * drop.mesh.scale.y) {
+            spreadChocolate(drop.mesh.position.x, drop.mesh.position.z);
+            drop.active = false;
+            drop.mesh.visible = false;
+          }
+        }
+        for (const puddle of puddles) {
+          if (!puddle.active) continue;
+          puddle.age += dt;
+          const spread = 1 - Math.exp(-puddle.age * 4);
+          const radius = THREE.MathUtils.lerp(0.075, puddle.radius, spread);
+          puddle.mesh.scale.set(
+            radius * puddle.aspect,
+            THREE.MathUtils.lerp(0.045, 0.012, spread),
+            radius / puddle.aspect
+          );
+          // Retain the melted chocolate, then slowly clear old puddles.
+          puddle.mesh.material.opacity = 1 - THREE.MathUtils.smoothstep(puddle.age, 25, 35);
+          if (puddle.age >= 35) {
+            puddle.active = false;
+            puddle.mesh.visible = false;
+          }
+        }
+      },
+    };
+    const sparkles = new Particles({ max: 260, size: 0.12, color: 0xfff0a0, gravity: 1.2, additive: true });
+
+    const _v = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    const start = new THREE.Vector3();
+    const tip = new THREE.Vector3();
+    const mid = new THREE.Vector3();
+    const dir = new THREE.Vector3();
+    const worldTip = new THREE.Vector3();
+
+    // Блёстки в точке: разлетаются во все стороны и гаснут
+    function sparkleBurst(x, y, z, count, power) {
+      for (let n = 0; n < count; n++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = power * (0.4 + Math.random() * 0.6);
+        sparkles.emit(x, y + 0.02, z,
+          Math.cos(a) * s, power * (0.5 + Math.random()), Math.sin(a) * s,
+          0.6 + Math.random() * 0.6);
+      }
+    }
+
+    // Обновляет одну каплю: медленно растёт, затем отрывается и падает
+    function updateDrip(d, dt) {
+      let snapped = false;
+      if (d.state === 'grow') {
+        d.len += d.speed * dt;
+        if (d.len >= d.maxLen) { d.state = 'snap'; snapped = true; }
+      } else {
+        d.len -= 1.5 * dt; // быстро втягивается обратно
+        if (d.len <= 0.05) { d.len = 0.05; d.state = 'grow'; }
+      }
+
+      // Капля лежит на сфере глазури и тянется по меридиану вниз
+      pointOn(EDGE - 0.03, d.phi, GLAZE_R, start);
+      pointOn(EDGE + d.len / GLAZE_R, d.phi, GLAZE_R, tip);
+      mid.addVectors(start, tip).multiplyScalar(0.5);
+      dir.subVectors(tip, start);
+      const chord = dir.length();
+      dir.divideScalar(chord);
+      d.body.position.copy(mid);
+      d.body.quaternion.setFromUnitVectors(up, dir);
+      d.body.scale.set(1, chord, 1);
+      d.bulb.position.copy(tip);
+
+      if (snapped) {
+        const p = scoopGroup.localToWorld(worldTip.copy(tip));
+        drops.emit(p.x, p.y, p.z, (Math.random() - 0.5) * 0.3, -0.3, (Math.random() - 0.5) * 0.3, 3);
+      }
+    }
+
+    // ---------- Анимация ----------
+    const clock = new THREE.Clock();
+    let sparkleTimer = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05);
+      const t = clock.elapsedTime;
+
+      // Idle: мягкое покачивание десерта и «дыхание» шарика
+      sundae.rotation.y = Math.sin(t * 0.3) * 0.35;
+      sundae.rotation.z = Math.sin(t * 1.4) * 0.015;
+      sundae.rotation.x = Math.cos(t * 1.1) * 0.012;
+      const breathe = Math.sin(t * 2.0);
+      scoopGroup.scale.set(1 + 0.01 * breathe, 1 - 0.015 * breathe, 1 + 0.01 * breathe);
+      sundae.updateMatrixWorld(true);
+
+      for (const d of drips) updateDrip(d, dt);
+
+      // Периодические блёстки на поверхности глазури
+      sparkleTimer -= dt;
+      if (sparkleTimer <= 0) {
+        sparkleTimer = 0.6 + Math.random() * 0.8;
+        pointOn(Math.random() * EDGE, Math.random() * Math.PI * 2, GLAZE_R + 0.03, _v);
+        const p = scoopGroup.localToWorld(_v);
+        sparkleBurst(p.x, p.y, p.z, 6, 0.9);
+      }
+
+      // Falling chocolate spreads into puddles on contact with the plate.
+      drops.update(dt);
+      sparkles.update(dt);
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // ---------- Адаптация под размер окна ----------
+    function onResize() {
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.fov = camera.aspect < 0.8 ? 52 : 38; // на узких экранах отодвигаем камеру
+      camera.updateProjectionMatrix();
+    }
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    animate();
+  </script>
+</body>
+</html>

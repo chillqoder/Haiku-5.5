@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Static Choir — vibe code studio</title>
+  <meta name="description" content="Static Choir is a vibe code studio. We write software by ear.">
+  <meta name="theme-color" content="#0c0a09">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5' fill='%230c0a09' stroke='%23d7ff3c' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='1.5' fill='%23d7ff3c'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="src/styles.css">
+
+  <script type="importmap">
+    { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+  </script>
+  <script type="module" src="src/main.js"></script>
+</head>
+<body>
+  <canvas id="field" aria-hidden="true"></canvas>
+
+  <header class="masthead">
+    <a class="wordmark" href="#tuning">Static<br>Choir</a>
+    <p class="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Tuned to I · Tuning</span>
+    </p>
+  </header>
+
+  <nav class="dial" aria-label="Movements">
+    <ol>
+      <li><button type="button" data-movement="tuning" aria-current="true"><span class="num">I</span><span class="name">Tuning</span></button></li>
+      <li><button type="button" data-movement="pieces" aria-current="false"><span class="num">II</span><span class="name">Pieces</span></button></li>
+      <li><button type="button" data-movement="method" aria-current="false"><span class="num">III</span><span class="name">Method</span></button></li>
+      <li><button type="button" data-movement="rack" aria-current="false"><span class="num">IV</span><span class="name">Rack</span></button></li>
+      <li><button type="button" data-movement="commission" aria-current="false"><span class="num">V</span><span class="name">Commission</span></button></li>
+    </ol>
+  </nav>
+
+  <main>
+    <section class="movement is-active" data-movement="tuning" id="tuning">
+      <p class="kicker">Vibe code studio — six people, one rule</p>
+      <h1 class="statement" data-tune>We write software <em>by ear.</em></h1>
+      <div class="tuning-notes">
+        <p class="lede">If the code doesn’t hum, we rewrite it. We build products, prototypes and odd little instruments for teams who would rather feel a thing working than read a forty-page spec.</p>
+        <p class="fine">Drag the cursor across the strings to strum them. Use the dial to change key.</p>
+      </div>
+    </section>
+
+    <section class="movement" data-movement="pieces" id="pieces">
+      <header class="movement-head">
+        <p class="kicker">II · Selected work, three of forty-one</p>
+        <h2 class="heading" data-tune>Pieces, <em>performed.</em></h2>
+      </header>
+
+      <div class="score">
+        <article class="piece">
+          <p class="piece-meta">Op. 01 · Fintech · 11 weeks</p>
+          <h3>Ledger in Ferrofluid</h3>
+          <p>A reconciliation engine that settles forty thousand payments before the office coffee machine warms up. Two engineers and one very opinionated cron job.</p>
+          <dl class="piece-key">
+            <div><dt>Key</dt><dd>C minor</dd></div>
+            <div><dt>Tempo</dt><dd>92 bpm</dd></div>
+            <div><dt>Stack</dt><dd>Rust, Postgres</dd></div>
+          </dl>
+          <button type="button" class="listen" data-mood="ledger">Listen</button>
+        </article>
+
+        <article class="piece">
+          <p class="piece-meta">Op. 02 · Hospitality · 7 weeks</p>
+          <h3>Kettle, Which Rings Twice</h3>
+          <p>Kitchen timers for a forty-seat restaurant, synced over the floor by touch. The pass never shouts again; the plates just tap the right waiter on the wrist.</p>
+          <dl class="piece-key">
+            <div><dt>Key</dt><dd>E flat</dd></div>
+            <div><dt>Tempo</dt><dd>140 bpm</dd></div>
+            <div><dt>Stack</dt><dd>Swift, BLE</dd></div>
+          </dl>
+          <button type="button" class="listen" data-mood="kettle">Listen</button>
+        </article>
+
+        <article class="piece">
+          <p class="piece-meta">Op. 03 · Culture · 19 weeks</p>
+          <h3>Lowlight, a Museum That Walks</h3>
+          <p>A guide for a gallery with no signal in its basement. Everything runs on the phone in your pocket, and the paintings start speaking when you stand in front of them.</p>
+          <dl class="piece-key">
+            <div><dt>Key</dt><dd>A minor</dd></div>
+            <div><dt>Tempo</dt><dd>54 bpm</dd></div>
+            <div><dt>Stack</dt><dd>Kotlin, SQLite</dd></div>
+          </dl>
+          <button type="button" class="listen" data-mood="lowlight">Listen</button>
+        </article>
+      </div>
+    </section>
+
+    <section class="movement" data-movement="method" id="method">
+      <header class="movement-head">
+        <p class="kicker">III · Four bars, no sprints</p>
+        <h2 class="heading" data-tune>Method, <em>in four bars.</em></h2>
+      </header>
+
+      <div class="bars-wrap">
+      <ol class="bars">
+        <li class="bar">
+          <span class="bar-count" aria-hidden="true">1</span>
+          <h3>Listen</h3>
+          <p>We ask what the thing should feel like before we ask what it should do. Two hours with the people who will swear at it later.</p>
+          <p class="bar-tempo">Adagio · a week, at most</p>
+        </li>
+        <li class="bar">
+          <span class="bar-count" aria-hidden="true">2</span>
+          <h3>Sketch</h3>
+          <p>A rough, ugly prototype by Thursday. Nothing ships from a sketch, but everything gets argued with while it is still working.</p>
+          <p class="bar-tempo">Allegro · three days</p>
+        </li>
+        <li class="bar">
+          <span class="bar-count" aria-hidden="true">3</span>
+          <h3>Sing</h3>
+          <p>Put it in front of real hands. We watch where people hesitate and tune the parts that buzz. Changes are judged by feel first, numbers second.</p>
+          <p class="bar-tempo">Moderato · until it hums</p>
+        </li>
+        <li class="bar">
+          <span class="bar-count" aria-hidden="true">4</span>
+          <h3>Tune</h3>
+          <p>Refactor until nothing rattles. Then we write the test that would have caught the rattle, and leave the code better than we found it.</p>
+          <p class="bar-tempo">Fermata · and then we stop</p>
+        </li>
+      </ol>
+        <span class="playhead" aria-hidden="true"></span>
+      </div>
+    </section>
+
+    <section class="movement" data-movement="rack" id="rack">
+      <header class="movement-head">
+        <p class="kicker">IV · What is on the rack tonight</p>
+        <h2 class="heading" data-tune>The rack, <em>plugged in.</em></h2>
+      </header>
+
+      <ul class="rack">
+        <li class="unit" style="--tempo: 1.1s">
+          <span class="unit-name">Kiln</span>
+          <span class="unit-role">Services and queues, anything that must not drop a note</span>
+          <span class="unit-spec">Rust · Tokio</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+        <li class="unit" style="--tempo: 1.7s">
+          <span class="unit-name">Tallow</span>
+          <span class="unit-role">Interfaces, design systems, the part people actually touch</span>
+          <span class="unit-spec">TypeScript · React</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+        <li class="unit" style="--tempo: 0.8s">
+          <span class="unit-name">Reed</span>
+          <span class="unit-role">Data models that stay honest after the third rewrite</span>
+          <span class="unit-spec">Postgres · SQL</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+        <li class="unit" style="--tempo: 1.4s">
+          <span class="unit-name">Bellows</span>
+          <span class="unit-role">Edge functions for the moments when latency is a mood</span>
+          <span class="unit-spec">Go · WebAssembly</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+        <li class="unit" style="--tempo: 2s">
+          <span class="unit-name">Gramophone</span>
+          <span class="unit-role">Pipelines that turn a messy spreadsheet into a song</span>
+          <span class="unit-spec">Python · DuckDB</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+        <li class="unit" style="--tempo: 0.6s">
+          <span class="unit-name">Clapper</span>
+          <span class="unit-role">Continuous delivery that claps only when the take is good</span>
+          <span class="unit-spec">Nix · GitHub Actions</span>
+          <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </li>
+      </ul>
+    </section>
+
+    <section class="movement" data-movement="commission" id="commission">
+      <header class="movement-head">
+        <p class="kicker">V · Commission a piece</p>
+        <h2 class="heading" data-tune>Write us something <em>strange.</em></h2>
+      </header>
+
+      <div class="commission">
+        <div class="commission-copy">
+          <p>We take four or five projects a year. Tell us what it should feel like, what it must do, and roughly when it has to be heard. We answer within two working days, always with a person who has opinions about it.</p>
+          <p class="fine">Commissions open in Q1 2027 · Studio in a converted ferry terminal, somewhere with a poor radio signal.</p>
+        </div>
+
+        <form class="brief" action="mailto:hello@staticchoir.example" method="post" enctype="text/plain">
+          <label class="field">
+            <span>Your name</span>
+            <input name="name" autocomplete="name" required>
+          </label>
+          <label class="field">
+            <span>What should it feel like?</span>
+            <textarea name="feel" rows="3" required></textarea>
+          </label>
+          <label class="field">
+            <span>Tempo · <output id="tempo-out">96</output> bpm</span>
+            <input type="range" id="tempo" name="tempo" min="60" max="180" value="96">
+          </label>
+          <button type="submit" class="send">Send the brief</button>
+        </form>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
